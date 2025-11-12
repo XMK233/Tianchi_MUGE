@@ -202,7 +202,7 @@ class ImageFeatureExtractor:
     timm 的 forward 将返回 GAP 后的特征；若选择 'fc' 且存在真实分类头，
     则返回 fc 后向量；否则退化为 GAP 特征（与 'gap' 等价）。
     '''
-    def __init__(self, model_name='resnet101', device='cpu', weights_path=None, cache_dir=None, feature_source: str = 'gap'):
+    def __init__(self, model_name='convnext_tiny', device='cpu', weights_path=None, cache_dir=None, feature_source: str = 'gap'):
         self.device = device
         self.feature_source = feature_source  # 'gap' 为全局池化后（fc 前）；'fc' 为分类层后
         # 保持原行为：使用 num_classes=0 得到 backbone 的特征输出
@@ -210,7 +210,7 @@ class ImageFeatureExtractor:
             self.model = timm.create_model(model_name, pretrained=True, num_classes=0, cache_dir=cache_dir)
         else:
             self.model = timm.create_model(
-                model_name, pretrained=False, num_classes=0, cache_dir=cache_dir,
+                model_name, pretrained=True, num_classes=0, cache_dir=cache_dir,
                 pretrained_cfg_overlay={'file': weights_path}
             )
 
@@ -347,7 +347,6 @@ class CrossModalRetrievalModel:
     def __init__(self, text_extractor, image_extractor, fusion_method='projection', projection_dim=512, similarity_type='cosine', normalize_features=True, device=None):
         self.text_extractor = text_extractor
         self.image_extractor = image_extractor
-        dev = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # 动态适配图像特征维度：依据 image_extractor.feature_source 决定输入维度
         img_in_dim = getattr(self.image_extractor.model, 'num_features', 2048)
         if getattr(self.image_extractor, 'feature_source', 'gap') == 'fc':
@@ -357,18 +356,7 @@ class CrossModalRetrievalModel:
         self.fusion = FeatureFusion(fusion_method, projection_dim, device, image_in_dim=img_in_dim)
         self.sim = SimilarityCalculator(similarity_type)
         self.normalize_features = normalize_features
-        self.device = dev
-        # 分模态两参数可学习温度（logit_scale_t, logit_scale_i）
-        init_temp = 0.07
-        init_logit = math.log(1.0 / init_temp)
-        self.logit_scale_t = torch.nn.Parameter(torch.tensor(init_logit, dtype=torch.float32, device=self.device))
-        self.logit_scale_i = torch.nn.Parameter(torch.tensor(init_logit, dtype=torch.float32, device=self.device))
-    def current_temperatures(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        t = 1.0 / torch.exp(self.logit_scale_t)
-        i = 1.0 / torch.exp(self.logit_scale_i)
-        t = torch.clamp(t, min=1e-3, max=10.0)
-        i = torch.clamp(i, min=1e-3, max=10.0)
-        return t, i
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.normalize(x, p=2, dim=1) if self.normalize_features else x
     def extract_and_fuse_text_features(self, texts: List[str]) -> torch.Tensor:
@@ -450,7 +438,12 @@ def unfreeze_text_top_layers(text_extractor: TextFeatureExtractor, last_n_layers
 def unfreeze_image_top_block(image_extractor: ImageFeatureExtractor, unfreeze_layer4: bool = True):
     for p in image_extractor.model.parameters():
         p.requires_grad = False
-    if unfreeze_layer4 and hasattr(image_extractor.model, 'layer4'):
+    # ConvNeXt 适配：若存在 stages，则优先解冻最后一个 stage
+    if hasattr(image_extractor.model, 'stages'):
+        for p in image_extractor.model.stages[-1].parameters():
+            p.requires_grad = True
+        image_extractor.model.stages[-1].train()
+    elif unfreeze_layer4 and hasattr(image_extractor.model, 'layer4'):
         for p in image_extractor.model.layer4.parameters():
             p.requires_grad = True
         image_extractor.model.layer4.train()
@@ -467,18 +460,29 @@ def unfreeze_image(image_extractor: ImageFeatureExtractor, mode: str = 'top'):
     for p in image_extractor.model.parameters():
         p.requires_grad = False
     if mode == 'top':
-        if hasattr(image_extractor.model, 'layer4'):
+        if hasattr(image_extractor.model, 'stages'):
+            for p in image_extractor.model.stages[-1].parameters():
+                p.requires_grad = True
+            image_extractor.model.stages[-1].train()
+        elif hasattr(image_extractor.model, 'layer4'):
             for p in image_extractor.model.layer4.parameters():
                 p.requires_grad = True
             image_extractor.model.layer4.train()
     else:  # mode == 'full'
-        # 解冻 stem 与各层 block
-        for name in ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']:
-            if hasattr(image_extractor.model, name):
-                mod = getattr(image_extractor.model, name)
-                for p in mod.parameters():
+        # ConvNeXt 全解冻：按 stages 逐层设置为 train
+        if hasattr(image_extractor.model, 'stages'):
+            for stage in image_extractor.model.stages:
+                for p in stage.parameters():
                     p.requires_grad = True
-                mod.train()
+                stage.train()
+        else:
+            # ResNet fallback：解冻 stem 与各层 block
+            for name in ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']:
+                if hasattr(image_extractor.model, name):
+                    mod = getattr(image_extractor.model, name)
+                    for p in mod.parameters():
+                        p.requires_grad = True
+                    mod.train()
     image_extractor.model.eval()
 def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeatureExtractor, image_extractor: ImageFeatureExtractor,
                    lr_proj: float = 1e-3, lr_text_top: float = 5e-5, lr_img_top: float = 1e-4, weight_decay: float = 1e-4):
@@ -496,8 +500,6 @@ def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeature
             'lr': lr_proj,
             'weight_decay': weight_decay
         })
-    # 加入分模态温度参数
-    params.append({'params': [model.logit_scale_t, model.logit_scale_i], 'lr': lr_proj, 'weight_decay': 0.0})
     text_top_params = []
     enc = text_extractor.model.encoder
     for mod in enc.layer[-2:]:
@@ -510,7 +512,9 @@ def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeature
         'weight_decay': 0.0
     })
     img_top_params = []
-    if hasattr(image_extractor.model, 'layer4'):
+    if hasattr(image_extractor.model, 'stages'):
+        img_top_params += list(image_extractor.model.stages[-1].parameters())
+    elif hasattr(image_extractor.model, 'layer4'):
         img_top_params += list(image_extractor.model.layer4.parameters())
     params.append({
         'params': [p for p in img_top_params if p.requires_grad],
@@ -540,8 +544,6 @@ def build_llrd_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFe
             'lr': lr_proj,
             'weight_decay': weight_decay
         })
-    # 加入分模态温度参数
-    params.append({'params': [model.logit_scale_t, model.logit_scale_i], 'lr': lr_proj, 'weight_decay': 0.0})
     # 文本顶层：逐层衰减（最顶层lr=lr_text_max，其次乘以decay）
     enc = text_extractor.model.encoder
     total_layers = len(enc.layer)
@@ -572,38 +574,53 @@ def build_llrd_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFe
         })
     # 图像侧 LLRD：
     if img_unfreeze_mode == 'top':
-        # 仅顶层 block 使用较大学习率
-        if hasattr(image_extractor.model, 'layer4'):
+        # 仅顶层：ConvNeXt 的最后一个 stage 或 ResNet 的 layer4
+        if hasattr(image_extractor.model, 'stages'):
+            params.append({
+                'params': [p for p in image_extractor.model.stages[-1].parameters() if p.requires_grad],
+                'lr': lr_img_top,
+                'weight_decay': 0.0
+            })
+        elif hasattr(image_extractor.model, 'layer4'):
             params.append({
                 'params': [p for p in image_extractor.model.layer4.parameters() if p.requires_grad],
                 'lr': lr_img_top,
                 'weight_decay': 0.0
             })
     else:
-        # 全解冻：按照 ResNet 层次递减学习率
-        # 从顶到底依次 layer4, layer3, layer2, layer1, stem(conv1+bn1)
-        order = 0
-        for name in ['layer4', 'layer3', 'layer2', 'layer1']:
-            if hasattr(image_extractor.model, name):
+        # 全解冻：ConvNeXt 的 stages 逐层递减学习率；若为 ResNet 则按原逻辑
+        if hasattr(image_extractor.model, 'stages'):
+            order = 0
+            for idx in range(len(image_extractor.model.stages)-1, -1, -1):
                 group_lr = lr_img_top * (decay ** order)
                 params.append({
-                    'params': [p for p in getattr(image_extractor.model, name).parameters() if p.requires_grad],
+                    'params': [p for p in image_extractor.model.stages[idx].parameters() if p.requires_grad],
                     'lr': group_lr,
                     'weight_decay': 0.0
                 })
                 order += 1
-        # stem（conv1+bn1），使用更小 lr
-        stem_params = []
-        if hasattr(image_extractor.model, 'conv1'):
-            stem_params += list(image_extractor.model.conv1.parameters())
-        if hasattr(image_extractor.model, 'bn1'):
-            stem_params += list(image_extractor.model.bn1.parameters())
-        if stem_params:
-            params.append({
-                'params': [p for p in stem_params if p.requires_grad],
-                'lr': lr_img_top * (decay ** 4),
-                'weight_decay': 0.0
-            })
+        else:
+            order = 0
+            for name in ['layer4', 'layer3', 'layer2', 'layer1']:
+                if hasattr(image_extractor.model, name):
+                    group_lr = lr_img_top * (decay ** order)
+                    params.append({
+                        'params': [p for p in getattr(image_extractor.model, name).parameters() if p.requires_grad],
+                        'lr': group_lr,
+                        'weight_decay': 0.0
+                    })
+                    order += 1
+            stem_params = []
+            if hasattr(image_extractor.model, 'conv1'):
+                stem_params += list(image_extractor.model.conv1.parameters())
+            if hasattr(image_extractor.model, 'bn1'):
+                stem_params += list(image_extractor.model.bn1.parameters())
+            if stem_params:
+                params.append({
+                    'params': [p for p in stem_params if p.requires_grad],
+                    'lr': lr_img_top * (decay ** 4),
+                    'weight_decay': 0.0
+                })
     optimizer = torch.optim.Adam(params)
     return optimizer
 
@@ -666,10 +683,9 @@ use_grad_checkpoint = False  # 可选：启用BERT梯度检查点以降低显存
 
 image_extractor = ImageFeatureExtractor(
     device=device,
-    feature_source='fc',  # 'gap' 使用全局池化后的 fc 前特征；改为 'fc' 可对比分类头后的向量
-    model_name='resnet101', 
-    weights_path='/mnt/d/HuggingFaceModels/models--timm--resnet50.a1_in1k/snapshots/767268603ca0cb0bfe326fa87277f19c419566ef/model.safetensors'
-
+    feature_source='gap',  # ConvNeXt 使用 GAP 特征（num_classes=0 时 forward 返回主干输出）
+    model_name='convnext_tiny', 
+    weights_path='/mnt/d/HuggingFaceModels/models--timm--convnext_tiny.in12k_ft_in1k/snapshots/aa096f03029c7f0ec052013f64c819b34f8ad790/model.safetensors'
 )
 text_extractor = TextFeatureExtractor(
     model_name = "hfl/chinese-roberta-wwm-ext", 
@@ -762,12 +778,9 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
                     # 修改点：支持早融合与后融合两种路径
                     t_feats = text_extractor.encode_with_grad(texts)
                     i_feats = image_extractor.encode_with_grad(imgs)
-                    t_temp, i_temp = model.current_temperatures()
                     if model.fusion.fusion_method == 'early':
                         # 早融合：拼接后统一打分得到 logits，再除以温度进入 InfoNCE
-                        # 采用几何平均温度，以兼顾两模态缩放
-                        temp = torch.sqrt(t_temp * i_temp)
-                        logits = model.compute_logits(t_feats, i_feats) / temp
+                        logits = model.compute_logits(t_feats, i_feats) / temperature
                         labels = torch.arange(logits.size(0), device=logits.device)
                         loss_t = torch.nn.functional.cross_entropy(logits, labels)
                         loss_i = torch.nn.functional.cross_entropy(logits.t(), labels)
@@ -776,13 +789,7 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
                         # 后融合：各自投影并归一化后做相似度再 InfoNCE
                         t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
                         i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
-                        # 分别缩放行/列温度：文本-图像方向用 t_temp，图像-文本方向用 i_temp
-                        logits_t = torch.mm(t_proj, i_proj.t()) / t_temp
-                        logits_i = torch.mm(i_proj, t_proj.t()) / i_temp
-                        labels = torch.arange(logits_t.size(0), device=logits_t.device)
-                        loss_t = torch.nn.functional.cross_entropy(logits_t, labels)
-                        loss_i = torch.nn.functional.cross_entropy(logits_i, labels)
-                        loss = (loss_t + loss_i) * 0.5
+                        loss = info_nce_loss(t_proj, i_proj, temp=temperature)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(
@@ -795,10 +802,8 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
             else:
                 t_feats = text_extractor.encode_with_grad(texts)
                 i_feats = image_extractor.encode_with_grad(imgs)
-                t_temp, i_temp = model.current_temperatures()
                 if model.fusion.fusion_method == 'early':
-                    temp = torch.sqrt(t_temp * i_temp)
-                    logits = model.compute_logits(t_feats, i_feats) / temp
+                    logits = model.compute_logits(t_feats, i_feats) / temperature
                     labels = torch.arange(logits.size(0), device=logits.device)
                     loss_t = torch.nn.functional.cross_entropy(logits, labels)
                     loss_i = torch.nn.functional.cross_entropy(logits.t(), labels)
@@ -806,12 +811,7 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
                 else:
                     t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
                     i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
-                    logits_t = torch.mm(t_proj, i_proj.t()) / t_temp
-                    logits_i = torch.mm(i_proj, t_proj.t()) / i_temp
-                    labels = torch.arange(logits_t.size(0), device=logits_t.device)
-                    loss_t = torch.nn.functional.cross_entropy(logits_t, labels)
-                    loss_i = torch.nn.functional.cross_entropy(logits_i, labels)
-                    loss = (loss_t + loss_i) * 0.5
+                    loss = info_nce_loss(t_proj, i_proj, temp=temperature)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
@@ -856,8 +856,6 @@ def save_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
     ckpt = {
         'projection_dim': model.fusion.projection_dim,
         'last_n_layers': last_n_layers,
-        'logit_scale_t': model.logit_scale_t.detach().cpu(),
-        'logit_scale_i': model.logit_scale_i.detach().cpu(),
         'fusion': {
             'text_projector': model.fusion.text_projector.state_dict(),
             'image_projector': model.fusion.image_projector.state_dict(),
@@ -873,7 +871,9 @@ def save_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
         ckpt['text_unfrozen'][f'encoder_layer_{i}'] = enc.layer[i].state_dict()
     if hasattr(text_extractor.model, 'pooler') and text_extractor.model.pooler is not None:
         ckpt['text_unfrozen']['pooler'] = text_extractor.model.pooler.state_dict()
-    if hasattr(image_extractor.model, 'layer4'):
+    if hasattr(image_extractor.model, 'stages'):
+        ckpt['image_unfrozen']['stages_last'] = image_extractor.model.stages[-1].state_dict()
+    elif hasattr(image_extractor.model, 'layer4'):
         ckpt['image_unfrozen']['layer4'] = image_extractor.model.layer4.state_dict()
     torch.save(ckpt, save_path)
     print(f"Checkpoint saved to: {save_path}")
@@ -894,13 +894,6 @@ def load_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
     ckpt = torch.load(load_path, map_location='cpu')
     model.fusion.text_projector.load_state_dict(ckpt['fusion']['text_projector'])
     model.fusion.image_projector.load_state_dict(ckpt['fusion']['image_projector'])
-    # 恢复可学习温度参数（分模态）
-    if 'logit_scale_t' in ckpt:
-        with torch.no_grad():
-            model.logit_scale_t.data.copy_(ckpt['logit_scale_t'].to(model.device))
-    if 'logit_scale_i' in ckpt:
-        with torch.no_grad():
-            model.logit_scale_i.data.copy_(ckpt['logit_scale_i'].to(model.device))
     ln = ckpt.get('last_n_layers', last_n_layers)
     unfreeze_text_top_layers(text_extractor, last_n_layers=ln)
     unfreeze_image_top_block(image_extractor, unfreeze_layer4=True)
@@ -912,7 +905,9 @@ def load_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
                 enc.layer[idx].load_state_dict(v)
     if 'pooler' in ckpt['text_unfrozen'] and hasattr(text_extractor.model, 'pooler') and text_extractor.model.pooler is not None:
         text_extractor.model.pooler.load_state_dict(ckpt['text_unfrozen']['pooler'])
-    if 'layer4' in ckpt['image_unfrozen'] and hasattr(image_extractor.model, 'layer4'):
+    if 'stages_last' in ckpt['image_unfrozen'] and hasattr(image_extractor.model, 'stages'):
+        image_extractor.model.stages[-1].load_state_dict(ckpt['image_unfrozen']['stages_last'])
+    elif 'layer4' in ckpt['image_unfrozen'] and hasattr(image_extractor.model, 'layer4'):
         image_extractor.model.layer4.load_state_dict(ckpt['image_unfrozen']['layer4'])
     if optimizer is not None and 'optimizer' in ckpt:
         optimizer.load_state_dict(ckpt['optimizer'])

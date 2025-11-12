@@ -1,11 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# * early: 早融合
-# * projection：后融合
-
 # In[1]:
-
 import argparse
 parser = argparse.ArgumentParser(description="设置一些参数")
 parser.add_argument(
@@ -80,7 +76,7 @@ save_path = os.path.join(save_dir, 'step_3_1_1__.pth')
 
 # import time
 # while True:
-#     if os.path.exists("step_3_1-7_师_cp1-基于6_cp2-fc前特征也就是gap.finishflag"):
+#     if os.path.exists("step_3_1-6_讼_cp2-基于5_cp2-换图像模型2.finishflag"):
 #         break
 #     time.sleep(5)
 
@@ -170,56 +166,30 @@ class TextFeatureExtractor:
         mean_pooled = summed / lengths
         return mean_pooled
 
-# class ImageFeatureExtractor:
-#     def __init__(self, model_name='resnet50', device='cpu', cache_dir=None):
-#         self.device = device
-#         self.model = timm.create_model(
-#             model_name, pretrained=True, num_classes=0,
-#             cache_dir=cache_dir
-#         ).to(device)
-#         self.model.eval()
-#         self.transform = transforms.Compose([
-#             transforms.Resize((224, 224)),
-#             transforms.ToTensor(),
-#             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-#         ])
-
-#     def encode_with_grad(self, images: List[Image.Image]) -> torch.Tensor:
-#         if not images:
-#             return torch.empty((0, 2048), dtype=torch.float32, device=self.device)
-#         tensors = torch.stack([self.transform(img.convert('RGB')) for img in images]).to(self.device)
-#         feats = self.model(tensors)
-#         return feats
-# image_extractor = ImageFeatureExtractor(device=device, cache_dir=cache_dir)
-
 from safetensors.torch import load_file
 class ImageFeatureExtractor:
     '''
-    改进版，使得 timm 不要每次都去连 huggingface；
-    并新增 feature_source 开关以对比 GAP 后（fc 前）与 fc 后特征。
-
-    注意：本模型在创建时设置 num_classes=0（无分类头），
-    timm 的 forward 将返回 GAP 后的特征；若选择 'fc' 且存在真实分类头，
-    则返回 fc 后向量；否则退化为 GAP 特征（与 'gap' 等价）。
+    改进版，使得timm不要每次都去连huggingface。
     '''
-    def __init__(self, model_name='resnet101', device='cpu', weights_path=None, cache_dir=None, feature_source: str = 'gap'):
+    def __init__(self, model_name='resnet50', device='cpu', weights_path=None, cache_dir=None):
         self.device = device
-        self.feature_source = feature_source  # 'gap' 为全局池化后（fc 前）；'fc' 为分类层后
-        # 保持原行为：使用 num_classes=0 得到 backbone 的特征输出
+
         if weights_path is None:
             self.model = timm.create_model(model_name, pretrained=True, num_classes=0, cache_dir=cache_dir)
         else:
             self.model = timm.create_model(
-                model_name, pretrained=False, num_classes=0, cache_dir=cache_dir,
+                model_name, pretrained=True, num_classes=0, cache_dir=cache_dir,
                 pretrained_cfg_overlay={'file': weights_path}
             )
-
-        if weights_path is not None:
-            if weights_path.endswith('.safetensors'):
-                state_dict = load_file(weights_path)
-            else:
-                state_dict = torch.load(weights_path, map_location='cpu')
-            self.model.load_state_dict(state_dict, strict=False)
+            ## 或者如下亦可：
+            # self.model = timm.create_model(
+            #     model_name, pretrained=False, num_classes=0, cache_dir=cache_dir,
+            # )
+            # if weights_path.endswith('.safetensors'):
+            #     state_dict = load_file(weights_path)
+            # else:
+            #     state_dict = torch.load(weights_path, map_location='cpu')
+            # self.model.load_state_dict(state_dict, strict=False)
 
         self.model = self.model.to(device)
         self.model.eval()
@@ -231,47 +201,13 @@ class ImageFeatureExtractor:
                                  std=[0.229, 0.224, 0.225])
         ])
 
-    def output_dim(self) -> int:
-        """
-        返回当前 feature_source 下的输出维度。
-        - gap: 使用 backbone 的 num_features。
-        - fc: 若存在真实分类头，返回 num_classes；否则退化为 num_features。
-        """
-        in_dim = getattr(self.model, 'num_features', 2048)
-        if self.feature_source == 'fc':
-            num_classes = getattr(self.model, 'num_classes', None)
-            if isinstance(num_classes, int) and num_classes > 0:
-                in_dim = num_classes
-        return in_dim
-
     def encode_with_grad(self, images: List[Image.Image]) -> torch.Tensor:
-        '''
-        根据 feature_source 返回不同阶段的图像特征：
-        - 'gap'：layer4 后经全局平均池化的特征（fc 前特征，维度通常为 num_features，例如 ResNet101 的 2048）。
-        - 'fc'：若存在真实分类头则返回其输出（fc 后特征）；否则回退为 GAP 特征。
-        '''
         if not images:
-            return torch.empty((0, self.output_dim()), dtype=torch.float32, device=self.device)
-
+            in_dim = getattr(self.model, 'num_features', 2048)
+            return torch.empty((0, in_dim), dtype=torch.float32, device=self.device)
         tensors = torch.stack([self.transform(img.convert('RGB')) for img in images]).to(self.device)
-
-        if self.feature_source == 'gap':
-            # 使用 forward_features + global_pool 获取 GAP 后的特征（fc 前）
-            if hasattr(self.model, 'forward_features'):
-                x = self.model.forward_features(tensors)
-                if hasattr(self.model, 'global_pool'):
-                    x = self.model.global_pool(x)
-                else:
-                    # 兜底：若模型未暴露 global_pool，则用自适应池化
-                    x = torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
-                return x
-            # 兜底：直接使用 forward（在 num_classes=0 时也会返回 GAP 特征）
-            return self.model(tensors)
-
-        # feature_source == 'fc'：若存在真实分类头，返回其输出；否则退化为 GAP 特征
-        # 由于本模型创建时 num_classes=0，forward 等同于 GAP 特征；
-        # 若你希望比较真实 fc 后的向量，可改为以 num_classes=1000 创建，并相应调整下游维度。
-        return self.model(tensors)
+        feats = self.model(tensors)
+        return feats
 
 class FeatureFusion:
     # 类作用：将原始文本/图像特征投影到共同的子空间（projection_dim）
@@ -308,28 +244,10 @@ class FeatureFusion:
             self.text_projector = torch.nn.Linear(text_in_dim, projection_dim).to(self.device)
             self.image_projector = torch.nn.Linear(image_in_dim, projection_dim).to(self.device)
 
-        elif fusion_method == 'early':
-            # 修改点：新增早融合统一评分网络：拼接 [text; image] 后用两层MLP输出分数
-            self.pair_projector = OptimizedMLPProjector(text_in_dim + image_in_dim, hidden_dim, 1, dropout=dropout).to(self.device)
-            ## torch.nn.Linear(text_in_dim + image_in_dim, 1).to(self.device)
-            ## OptimizedMLPProjector(text_in_dim + image_in_dim, hidden_dim, 1, dropout=dropout).to(self.device)
-
     def fuse_text_features(self, text_features: torch.Tensor) -> torch.Tensor:
-        # 后融合：返回投影后的文本特征；早融合：直接返回原始文本特征用于后续拼接
         return self.text_projector(text_features) if self.fusion_method == 'projection' else text_features
     def fuse_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
-        # 后融合：返回投影后的图像特征；早融合：直接返回原始图像特征用于后续拼接
         return self.image_projector(image_features) if self.fusion_method == 'projection' else image_features
-    def pair_scores_matrix(self, text_features: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
-        # 早融合：对所有 (文本, 图像) 对拼接并统一打分，返回 [B_text, B_image] 分数矩阵
-        assert self.fusion_method == 'early', "pair_scores_matrix 仅在 'early' 模式下使用"
-        Bt = text_features.size(0)
-        Bi = image_features.size(0)
-        t_exp = text_features.unsqueeze(1).expand(Bt, Bi, text_features.size(1))
-        i_exp = image_features.unsqueeze(0).expand(Bt, Bi, image_features.size(1))
-        cat = torch.cat([t_exp, i_exp], dim=-1)
-        scores = self.pair_projector(cat.view(Bt * Bi, -1)).view(Bt, Bi)
-        return scores
 
 class SimilarityCalculator:
     def __init__(self, similarity_type='cosine'):
@@ -347,55 +265,26 @@ class CrossModalRetrievalModel:
     def __init__(self, text_extractor, image_extractor, fusion_method='projection', projection_dim=512, similarity_type='cosine', normalize_features=True, device=None):
         self.text_extractor = text_extractor
         self.image_extractor = image_extractor
-        dev = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # 动态适配图像特征维度：依据 image_extractor.feature_source 决定输入维度
+        # 动态适配图像特征维度：ConvNeXt-Tiny 为 768，ResNet50 为 2048
         img_in_dim = getattr(self.image_extractor.model, 'num_features', 2048)
-        if getattr(self.image_extractor, 'feature_source', 'gap') == 'fc':
-            num_classes = getattr(self.image_extractor.model, 'num_classes', None)
-            if isinstance(num_classes, int) and num_classes > 0:
-                img_in_dim = num_classes
         self.fusion = FeatureFusion(fusion_method, projection_dim, device, image_in_dim=img_in_dim)
         self.sim = SimilarityCalculator(similarity_type)
         self.normalize_features = normalize_features
-        self.device = dev
-        # 分模态两参数可学习温度（logit_scale_t, logit_scale_i）
-        init_temp = 0.07
-        init_logit = math.log(1.0 / init_temp)
-        self.logit_scale_t = torch.nn.Parameter(torch.tensor(init_logit, dtype=torch.float32, device=self.device))
-        self.logit_scale_i = torch.nn.Parameter(torch.tensor(init_logit, dtype=torch.float32, device=self.device))
-    def current_temperatures(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        t = 1.0 / torch.exp(self.logit_scale_t)
-        i = 1.0 / torch.exp(self.logit_scale_i)
-        t = torch.clamp(t, min=1e-3, max=10.0)
-        i = torch.clamp(i, min=1e-3, max=10.0)
-        return t, i
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.normalize(x, p=2, dim=1) if self.normalize_features else x
     def extract_and_fuse_text_features(self, texts: List[str]) -> torch.Tensor:
         # 评估阶段禁用 BN/Dropout 的训练行为
+        self.fusion.text_projector.eval()
         with torch.no_grad():
             t = self.text_extractor.encode_with_grad(texts)
-        if self.fusion.fusion_method == 'projection':
-            self.fusion.text_projector.eval()
-            return self._norm(self.fusion.fuse_text_features(t))
-        # 早融合：返回原始文本特征
-        return t
+        return self._norm(self.fusion.fuse_text_features(t))
     def extract_and_fuse_image_features(self, images: List[Image.Image]) -> torch.Tensor:
         # 评估阶段禁用 BN/Dropout 的训练行为
+        self.fusion.image_projector.eval()
         with torch.no_grad():
             i = self.image_extractor.encode_with_grad(images)
-        if self.fusion.fusion_method == 'projection':
-            self.fusion.image_projector.eval()
-            return self._norm(self.fusion.fuse_image_features(i))
-        # 早融合：返回原始图像特征
-        return i
-    def compute_logits(self, text_features: torch.Tensor, image_features: torch.Tensor) -> torch.Tensor:
-        # 修改点：新增统一的 logits 计算接口
-        if self.fusion.fusion_method == 'early':
-            return self.fusion.pair_scores_matrix(text_features, image_features)
-        t_proj = self._norm(self.fusion.fuse_text_features(text_features))
-        i_proj = self._norm(self.fusion.fuse_image_features(image_features))
-        return torch.mm(t_proj, i_proj.t())
+        return self._norm(self.fusion.fuse_image_features(i))
     def build_image_index(self, images_dict: Dict[str, Image.Image], batch_size: int = 32) -> Dict[str, torch.Tensor]:
         feats = {}
         keys = list(images_dict.keys())
@@ -411,7 +300,6 @@ class CrossModalRetrievalModel:
         return feats
 
 def info_nce_loss(text_feats: torch.Tensor, image_feats: torch.Tensor, temp: float) -> torch.Tensor:
-    # 修改点：在 'early' 模式下，外部会传入原始特征并用统一打分接口产生 logits
     logits = torch.mm(text_feats, image_feats.t()) / temp
     labels = torch.arange(logits.size(0), device=logits.device)
     loss_t = torch.nn.functional.cross_entropy(logits, labels)
@@ -450,54 +338,24 @@ def unfreeze_text_top_layers(text_extractor: TextFeatureExtractor, last_n_layers
 def unfreeze_image_top_block(image_extractor: ImageFeatureExtractor, unfreeze_layer4: bool = True):
     for p in image_extractor.model.parameters():
         p.requires_grad = False
-    if unfreeze_layer4 and hasattr(image_extractor.model, 'layer4'):
+    if hasattr(image_extractor.model, 'stages'):
+        for p in image_extractor.model.stages[-1].parameters():
+            p.requires_grad = True
+        image_extractor.model.stages[-1].train()
+    elif unfreeze_layer4 and hasattr(image_extractor.model, 'layer4'):
         for p in image_extractor.model.layer4.parameters():
             p.requires_grad = True
         image_extractor.model.layer4.train()
     image_extractor.model.eval()
 
-# 修改点（依据 3.1.3 的改进方案 L12）：
-# 新增通用图像解冻函数，可在顶层解冻与全解冻之间切换，以便对比训练稳定性与检索效果。
-def unfreeze_image(image_extractor: ImageFeatureExtractor, mode: str = 'top'):
-    """
-    mode='top'：仅解冻 layer4（顶层 block），保持大部分骨干冻结，训练更稳健；
-    mode='full'：全解冻图像骨干（包含 stem/各层 block），适配更强的适应能力但需更稳的优化策略。
-    """
-    # 先全部冻结
-    for p in image_extractor.model.parameters():
-        p.requires_grad = False
-    if mode == 'top':
-        if hasattr(image_extractor.model, 'layer4'):
-            for p in image_extractor.model.layer4.parameters():
-                p.requires_grad = True
-            image_extractor.model.layer4.train()
-    else:  # mode == 'full'
-        # 解冻 stem 与各层 block
-        for name in ['conv1', 'bn1', 'layer1', 'layer2', 'layer3', 'layer4']:
-            if hasattr(image_extractor.model, name):
-                mod = getattr(image_extractor.model, name)
-                for p in mod.parameters():
-                    p.requires_grad = True
-                mod.train()
-    image_extractor.model.eval()
 def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeatureExtractor, image_extractor: ImageFeatureExtractor,
                    lr_proj: float = 1e-3, lr_text_top: float = 5e-5, lr_img_top: float = 1e-4, weight_decay: float = 1e-4):
     params = []
-    # 修改点：根据融合方式设置优化器分组
-    if model.fusion.fusion_method == 'early':
-        params.append({
-            'params': list(model.fusion.pair_projector.parameters()),
-            'lr': lr_proj,
-            'weight_decay': weight_decay
-        })
-    else:
-        params.append({
-            'params': list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
-            'lr': lr_proj,
-            'weight_decay': weight_decay
-        })
-    # 加入分模态温度参数
-    params.append({'params': [model.logit_scale_t, model.logit_scale_i], 'lr': lr_proj, 'weight_decay': 0.0})
+    params.append({
+        'params': list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
+        'lr': lr_proj,
+        'weight_decay': weight_decay
+    })
     text_top_params = []
     enc = text_extractor.model.encoder
     for mod in enc.layer[-2:]:
@@ -510,7 +368,9 @@ def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeature
         'weight_decay': 0.0
     })
     img_top_params = []
-    if hasattr(image_extractor.model, 'layer4'):
+    if hasattr(image_extractor.model, 'stages'):
+        img_top_params += list(image_extractor.model.stages[-1].parameters())
+    elif hasattr(image_extractor.model, 'layer4'):
         img_top_params += list(image_extractor.model.layer4.parameters())
     params.append({
         'params': [p for p in img_top_params if p.requires_grad],
@@ -521,27 +381,16 @@ def build_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeature
     return optimizer
 
 # LLRD（Layer-wise LR Decay）优化器构建：为BERT顶层设置逐层衰减学习率
-# 修改点（依据 3.1.3 的改进方案 L12）：
-# 为图像编码器新增 LLRD 的全解冻分层学习率：layer4 > layer3 > layer2 > layer1 > stem。
 def build_llrd_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFeatureExtractor, image_extractor: ImageFeatureExtractor,
                          lr_proj: float = 1e-3, lr_text_max: float = 5e-5, lr_img_top: float = 1e-4, decay: float = 0.9,
-                         last_n_layers: int = 2, weight_decay: float = 1e-4, img_unfreeze_mode: str = 'top'):
+                         last_n_layers: int = 2, weight_decay: float = 1e-4):
     params = []
-    # 投影层分组：后融合为两个线性层；早融合为统一 pair_projector
-    if model.fusion.fusion_method == 'early':
-        params.append({
-            'params': list(model.fusion.pair_projector.parameters()),
-            'lr': lr_proj,
-            'weight_decay': weight_decay
-        })
-    else:
-        params.append({
-            'params': list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
-            'lr': lr_proj,
-            'weight_decay': weight_decay
-        })
-    # 加入分模态温度参数
-    params.append({'params': [model.logit_scale_t, model.logit_scale_i], 'lr': lr_proj, 'weight_decay': 0.0})
+    # 投影层（文本/图像）
+    params.append({
+        'params': list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
+        'lr': lr_proj,
+        'weight_decay': weight_decay
+    })
     # 文本顶层：逐层衰减（最顶层lr=lr_text_max，其次乘以decay）
     enc = text_extractor.model.encoder
     total_layers = len(enc.layer)
@@ -570,40 +419,19 @@ def build_llrd_optimizer(model: CrossModalRetrievalModel, text_extractor: TextFe
             'lr': lr_text_max,
             'weight_decay': 0.0
         })
-    # 图像侧 LLRD：
-    if img_unfreeze_mode == 'top':
-        # 仅顶层 block 使用较大学习率
-        if hasattr(image_extractor.model, 'layer4'):
-            params.append({
-                'params': [p for p in image_extractor.model.layer4.parameters() if p.requires_grad],
-                'lr': lr_img_top,
-                'weight_decay': 0.0
-            })
-    else:
-        # 全解冻：按照 ResNet 层次递减学习率
-        # 从顶到底依次 layer4, layer3, layer2, layer1, stem(conv1+bn1)
-        order = 0
-        for name in ['layer4', 'layer3', 'layer2', 'layer1']:
-            if hasattr(image_extractor.model, name):
-                group_lr = lr_img_top * (decay ** order)
-                params.append({
-                    'params': [p for p in getattr(image_extractor.model, name).parameters() if p.requires_grad],
-                    'lr': group_lr,
-                    'weight_decay': 0.0
-                })
-                order += 1
-        # stem（conv1+bn1），使用更小 lr
-        stem_params = []
-        if hasattr(image_extractor.model, 'conv1'):
-            stem_params += list(image_extractor.model.conv1.parameters())
-        if hasattr(image_extractor.model, 'bn1'):
-            stem_params += list(image_extractor.model.bn1.parameters())
-        if stem_params:
-            params.append({
-                'params': [p for p in stem_params if p.requires_grad],
-                'lr': lr_img_top * (decay ** 4),
-                'weight_decay': 0.0
-            })
+    # 图像顶层（ConvNeXt stages[-1] 或 ResNet layer4）
+    if hasattr(image_extractor.model, 'stages'):
+        params.append({
+            'params': [p for p in image_extractor.model.stages[-1].parameters() if p.requires_grad],
+            'lr': lr_img_top,
+            'weight_decay': 0.0
+        })
+    elif hasattr(image_extractor.model, 'layer4'):
+        params.append({
+            'params': [p for p in image_extractor.model.layer4.parameters() if p.requires_grad],
+            'lr': lr_img_top,
+            'weight_decay': 0.0
+        })
     optimizer = torch.optim.Adam(params)
     return optimizer
 
@@ -665,12 +493,15 @@ use_grad_checkpoint = False  # 可选：启用BERT梯度检查点以降低显存
 
 
 image_extractor = ImageFeatureExtractor(
-    device=device,
-    feature_source='fc',  # 'gap' 使用全局池化后的 fc 前特征；改为 'fc' 可对比分类头后的向量
-    model_name='resnet101', 
-    weights_path='/mnt/d/HuggingFaceModels/models--timm--resnet50.a1_in1k/snapshots/767268603ca0cb0bfe326fa87277f19c419566ef/model.safetensors'
-
+    device=device, 
+    model_name='convnext_tiny', 
+    weights_path='/mnt/d/HuggingFaceModels/models--timm--convnext_tiny.in12k_ft_in1k/snapshots/aa096f03029c7f0ec052013f64c819b34f8ad790/model.safetensors'
 )
+
+
+# In[9]:
+
+
 text_extractor = TextFeatureExtractor(
     model_name = "hfl/chinese-roberta-wwm-ext", 
     device=device, 
@@ -678,9 +509,6 @@ text_extractor = TextFeatureExtractor(
     pooling='attentive'
 )
 
-
-# 修改点（依据 3.1.3 的改进方案 L16）：将融合方式切换为“后融合”（projection），
-# 即文本与图像分别投影并归一化后，再用相似度计算器打分；便于与“早融合”对比。
 model = CrossModalRetrievalModel(
     text_extractor, image_extractor, 
     fusion_method='projection', projection_dim=512, similarity_type='cosine', normalize_features=True, device=device
@@ -691,15 +519,12 @@ if use_grad_checkpoint and hasattr(text_extractor.model, 'gradient_checkpointing
     text_extractor.model.gradient_checkpointing_enable()
 
 unfreeze_text_top_layers(text_extractor, last_n_layers=last_n_layers)
-# 修改点（依据 3.1.3 的改进方案 L12）：切换图像解冻模式以做实验对比
-img_unfreeze_mode = 'full'  # 可选 'top'（仅layer4）或 'full'（全解冻）
-unfreeze_image(image_extractor, mode=img_unfreeze_mode)
+unfreeze_image_top_block(image_extractor, unfreeze_layer4=True)
 
 # 使用LLRD优化器：为文本顶层设置逐层衰减的学习率
-# 修改点（依据 3.1.3 的改进方案 L12）：为全解冻提供分层学习率（LLRD）
 optim = build_llrd_optimizer(model, text_extractor, image_extractor,
                              lr_proj=1e-3, lr_text_max=5e-5, lr_img_top=1e-4, decay=0.9,
-                             last_n_layers=last_n_layers, weight_decay=1e-4, img_unfreeze_mode=img_unfreeze_mode)
+                             last_n_layers=last_n_layers, weight_decay=1e-4)
 scaler = GradScaler(enabled=(device.type == 'cuda' and use_amp))
 print('Optim groups:', len(optim.param_groups))
 
@@ -708,7 +533,7 @@ print('Optim groups:', len(optim.param_groups))
 # 仅使用配对中的第一张可用图片；文本与图像编码器顶层参与反向传播。
 # 
 
-# In[9]:
+# In[10]:
 
 
 def build_batch_pairs(train_df, img_dict: Dict[str, Image.Image]) -> List[Tuple[str, Image.Image, str]]:
@@ -738,7 +563,9 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
     text_extractor.model.encoder.layer[-2].train()
     if hasattr(text_extractor.model, 'pooler') and text_extractor.model.pooler is not None:
         text_extractor.model.pooler.train()
-    if hasattr(image_extractor.model, 'layer4'):
+    if hasattr(image_extractor.model, 'stages'):
+        image_extractor.model.stages[-1].train()
+    elif hasattr(image_extractor.model, 'layer4'):
         image_extractor.model.layer4.train()
 
     # 为当前大batch构建 Warmup+Cosine 学习率调度器（按总steps）
@@ -759,30 +586,11 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
             optim.zero_grad()
             if use_amp and device.type == 'cuda':
                 with autocast(enabled=True):
-                    # 修改点：支持早融合与后融合两种路径
                     t_feats = text_extractor.encode_with_grad(texts)
                     i_feats = image_extractor.encode_with_grad(imgs)
-                    t_temp, i_temp = model.current_temperatures()
-                    if model.fusion.fusion_method == 'early':
-                        # 早融合：拼接后统一打分得到 logits，再除以温度进入 InfoNCE
-                        # 采用几何平均温度，以兼顾两模态缩放
-                        temp = torch.sqrt(t_temp * i_temp)
-                        logits = model.compute_logits(t_feats, i_feats) / temp
-                        labels = torch.arange(logits.size(0), device=logits.device)
-                        loss_t = torch.nn.functional.cross_entropy(logits, labels)
-                        loss_i = torch.nn.functional.cross_entropy(logits.t(), labels)
-                        loss = (loss_t + loss_i) * 0.5
-                    else:
-                        # 后融合：各自投影并归一化后做相似度再 InfoNCE
-                        t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
-                        i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
-                        # 分别缩放行/列温度：文本-图像方向用 t_temp，图像-文本方向用 i_temp
-                        logits_t = torch.mm(t_proj, i_proj.t()) / t_temp
-                        logits_i = torch.mm(i_proj, t_proj.t()) / i_temp
-                        labels = torch.arange(logits_t.size(0), device=logits_t.device)
-                        loss_t = torch.nn.functional.cross_entropy(logits_t, labels)
-                        loss_i = torch.nn.functional.cross_entropy(logits_i, labels)
-                        loss = (loss_t + loss_i) * 0.5
+                    t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
+                    i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
+                    loss = info_nce_loss(t_proj, i_proj, temp=temperature)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optim)
                 torch.nn.utils.clip_grad_norm_(
@@ -795,23 +603,9 @@ def train_one_batch(pairs: List[Tuple[str, Image.Image, str]], epochs: int, step
             else:
                 t_feats = text_extractor.encode_with_grad(texts)
                 i_feats = image_extractor.encode_with_grad(imgs)
-                t_temp, i_temp = model.current_temperatures()
-                if model.fusion.fusion_method == 'early':
-                    temp = torch.sqrt(t_temp * i_temp)
-                    logits = model.compute_logits(t_feats, i_feats) / temp
-                    labels = torch.arange(logits.size(0), device=logits.device)
-                    loss_t = torch.nn.functional.cross_entropy(logits, labels)
-                    loss_i = torch.nn.functional.cross_entropy(logits.t(), labels)
-                    loss = (loss_t + loss_i) * 0.5
-                else:
-                    t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
-                    i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
-                    logits_t = torch.mm(t_proj, i_proj.t()) / t_temp
-                    logits_i = torch.mm(i_proj, t_proj.t()) / i_temp
-                    labels = torch.arange(logits_t.size(0), device=logits_t.device)
-                    loss_t = torch.nn.functional.cross_entropy(logits_t, labels)
-                    loss_i = torch.nn.functional.cross_entropy(logits_i, labels)
-                    loss = (loss_t + loss_i) * 0.5
+                t_proj = model._norm(model.fusion.fuse_text_features(t_feats))
+                i_proj = model._norm(model.fusion.fuse_image_features(i_feats))
+                loss = info_nce_loss(t_proj, i_proj, temp=temperature)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     list(model.fusion.text_projector.parameters()) + list(model.fusion.image_projector.parameters()),
@@ -847,7 +641,7 @@ for image_batch in loader.load_images_batch(split='train', batch_size=train_imag
 # 保存 BERT 的最后2层 + pooler、ResNet50 的 layer4、投影层、优化器。
 # 
 
-# In[10]:
+# In[11]:
 
 
 def save_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: TextFeatureExtractor, image_extractor: ImageFeatureExtractor,
@@ -856,8 +650,6 @@ def save_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
     ckpt = {
         'projection_dim': model.fusion.projection_dim,
         'last_n_layers': last_n_layers,
-        'logit_scale_t': model.logit_scale_t.detach().cpu(),
-        'logit_scale_i': model.logit_scale_i.detach().cpu(),
         'fusion': {
             'text_projector': model.fusion.text_projector.state_dict(),
             'image_projector': model.fusion.image_projector.state_dict(),
@@ -886,7 +678,7 @@ save_unfreeze_checkpoint(model, text_extractor, image_extractor, optim, save_pat
 # 加载后会自动再次执行顶层解冻，并恢复优化器状态（如提供）。
 # 
 
-# In[11]:
+# In[12]:
 
 
 def load_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: TextFeatureExtractor, image_extractor: ImageFeatureExtractor,
@@ -894,13 +686,6 @@ def load_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
     ckpt = torch.load(load_path, map_location='cpu')
     model.fusion.text_projector.load_state_dict(ckpt['fusion']['text_projector'])
     model.fusion.image_projector.load_state_dict(ckpt['fusion']['image_projector'])
-    # 恢复可学习温度参数（分模态）
-    if 'logit_scale_t' in ckpt:
-        with torch.no_grad():
-            model.logit_scale_t.data.copy_(ckpt['logit_scale_t'].to(model.device))
-    if 'logit_scale_i' in ckpt:
-        with torch.no_grad():
-            model.logit_scale_i.data.copy_(ckpt['logit_scale_i'].to(model.device))
     ln = ckpt.get('last_n_layers', last_n_layers)
     unfreeze_text_top_layers(text_extractor, last_n_layers=ln)
     unfreeze_image_top_block(image_extractor, unfreeze_layer4=True)
@@ -927,7 +712,7 @@ def load_unfreeze_checkpoint(model: CrossModalRetrievalModel, text_extractor: Te
 # - 对每条查询计算相似度并统计召回（优先使用 FAISS；不可用则 Torch 回退）
 # 
 
-# In[12]:
+# In[13]:
 
 
 valid_imgs = loader.create_img_id_to_image_dict(
@@ -948,11 +733,7 @@ print(f'Usable valid queries: {len(valid_queries)}')
 
 image_index = model.build_image_index(valid_imgs, batch_size=32)
 all_image_ids = list(image_index.keys())
-# 修改点：早融合下不做图像侧投影与归一化索引，直接缓存原始图像特征；后融合保持为 512 维投影
-if model.fusion.fusion_method == 'early':
-    all_image_feats = torch.stack([image_index[i] for i in all_image_ids]) if all_image_ids else torch.empty((0, getattr(model.image_extractor, 'output_dim', lambda:2048)()) )
-else:
-    all_image_feats = torch.stack([image_index[i] for i in all_image_ids]) if all_image_ids else torch.empty((0, 512))
+all_image_feats = torch.stack([image_index[i] for i in all_image_ids]) if all_image_ids else torch.empty((0, 512))
 faiss_index = None
 if HAS_FAISS and all_image_feats.size(0) > 0:
     d = all_image_feats.size(1)
@@ -968,24 +749,16 @@ def compute_recall_at_k(k_values, queries):
     for q_text, gt_ids in tqdm(queries, desc='Evaluate'):
         if all_image_feats.size(0) == 0:
             continue
-        if model.fusion.fusion_method == 'early':
-            # 早融合：逐块计算文本与所有候选图像的 pairwise 分数
-            q_feat = model.extract_and_fuse_text_features([q_text])
-            scores = model.compute_logits(q_feat, all_image_feats)  # [1, N]
-            _, top_idx = torch.topk(scores[0], k=max(k_values))
-            top_ids = [all_image_ids[i] for i in top_idx.tolist()]
+        q_feat = model.extract_and_fuse_text_features([q_text])
+        if faiss_index is not None:
+            q_np = q_feat.detach().cpu().numpy().astype('float32')
+            _, I = faiss_index.search(q_np, max(k_values))
+            top_idx = I[0].tolist()
+            top_ids = [all_image_ids[i] for i in top_idx]
         else:
-            # 后融合：使用相似度计算器（cosine/dot）
-            q_feat = model.extract_and_fuse_text_features([q_text])
-            if faiss_index is not None:
-                q_np = q_feat.detach().cpu().numpy().astype('float32')
-                _, I = faiss_index.search(q_np, max(k_values))
-                top_idx = I[0].tolist()
-                top_ids = [all_image_ids[i] for i in top_idx]
-            else:
-                sims = model.sim.calculate_similarity(q_feat, all_image_feats)
-                _, top_idx = torch.topk(sims[0], k=max(k_values))
-                top_ids = [all_image_ids[i] for i in top_idx.tolist()]
+            sims = model.sim.calculate_similarity(q_feat, all_image_feats)
+            _, top_idx = torch.topk(sims[0], k=max(k_values))
+            top_ids = [all_image_ids[i] for i in top_idx.tolist()]
         total += 1
         for k in k_values:
             if any(g in set(top_ids[:k]) for g in gt_ids):
@@ -1003,7 +776,7 @@ print(f'Recall@1={rec.get(1,0):.4f}, Recall@5={rec.get(5,0):.4f}, Recall@10={rec
 
 
 
-# In[13]:
+# In[14]:
 
 
 with open(f"{os.path.basename(__file__).split('.')[0]}.finishflag", "w") as f:
