@@ -1,0 +1,25 @@
+{
+  "model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
+  "trust_remote_code": true,
+  "image_size": 224,
+  "batch_size": 2,
+  "epochs": 1,
+  "learning_rate": 2e-5,
+  "weight_decay": 0.0,
+  "warmup_steps": 100,
+  "save_steps": 500,
+  "max_samples": null,
+  "mixed_precision": "bf16",
+  "torch_dtype": "bfloat16",
+  "device_map": "auto",
+  "use_lora": true,
+  "use_qlora": false,
+  "lora_r": 4,
+  "lora_alpha": 8,
+  "lora_dropout": 0.05,
+  "target_modules": ["q_proj", "v_proj"]
+  ,"pics_for_one_trn_round": 1000
+  ,"num_trn_rounds": 1
+  ,"log_steps": 50
+}
+
