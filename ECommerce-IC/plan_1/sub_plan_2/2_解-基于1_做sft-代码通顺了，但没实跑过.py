@@ -36,6 +36,24 @@ from data_loader import (
     ICTsvJsonlDataset,
 )
 import tqdm
+import gc
+
+def free_torch_memory():
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        for i in range(torch.cuda.device_count()):
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+            log.info(f"[GPU{i}] after cleanup used={mem.used/1024**2:.2f} MB / total={mem.total/1024**2:.2f} MB")
+    except Exception:
+        pass
 
 
 log = logging.getLogger("pipeline_template")
@@ -173,9 +191,21 @@ def load_qwen_vl(local_dir: str, for_training: bool = False):
             resolved_dir,
             trust_remote_code=True,
             dtype='auto',
-            device_map='auto',
+            device_map=None,  # 避免自动切到 CPU，统一由我们手动放到 CUDA
             local_files_only=True,
         )
+        # 推理场景尽量将整模移动到 CUDA，以确保真正使用 GPU 进行计算
+        try:
+            if torch.cuda.is_available():
+                model.to(torch.device('cuda'))
+                # 记录主参数设备，便于诊断 GPU 未被利用的问题
+                try:
+                    dev = next(model.parameters()).device
+                    log.info(f"[Infer] model moved to device: {dev}")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.info(f"[Infer] model.to(cuda) skipped: {e}")
         # 推理侧启用缓存与更快的注意力实现（如可用则使用 FlashAttention2，否则回退到 SDPA）
         try:
             if hasattr(model, 'config'):
@@ -220,16 +250,31 @@ def _caption_one_image(image, model, processor, prompt: str = "请用中文简�
         inputs = {k: (v.to(dev) if hasattr(v, 'to') else v) for k, v in inputs.items()}
     if hasattr(model, 'generate'):
         with torch.inference_mode():
-            out = model.generate(**inputs, max_new_tokens=64, do_sample=False)
+            tok = getattr(processor, 'tokenizer', None)
+            gen_kwargs = {
+                'max_new_tokens': 64,
+                'do_sample': False,
+                'no_repeat_ngram_size': 3,
+                'repetition_penalty': 1.1,
+                'early_stopping': True,
+            }
+            if tok is not None:
+                if getattr(tok, 'eos_token_id', None) is not None:
+                    gen_kwargs['eos_token_id'] = tok.eos_token_id
+                if getattr(tok, 'pad_token_id', None) is not None:
+                    gen_kwargs['pad_token_id'] = tok.pad_token_id
+            out = model.generate(**inputs, **gen_kwargs)
         # 仅解码生成的新 token，避免包含原始对话文本
         in_ids = inputs.get("input_ids")
         if in_ids is not None:
             gen_ids = out[0][in_ids[0].shape[0]:].detach().cpu()
             text = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+            text = _sanitize_text(text, tok, 64)
             return str(text).strip()
         else:
             decoded = processor.batch_decode(out, skip_special_tokens=True)
-            return str(decoded[0]).strip()
+            t = _sanitize_text(decoded[0], tok, 64)
+            return str(t).strip()
 
     # 2) 回退：兼容不同 chat 签名
     if hasattr(model, 'chat'):
@@ -249,6 +294,44 @@ def _caption_one_image(image, model, processor, prompt: str = "请用中文简�
     return "这是一张电商商品图片。"
 
 
+def _sanitize_text(text: str, tokenizer=None, max_new_tokens: int | None = None) -> str:
+    """轻量后处理：去除首尾多余标点/空白、简单去重片段、长度兜底约束。
+
+    - 去除首尾中文/英文常见标点和空白；
+    - 按中文逗号分段，移除连续重复片段（保留顺序）；
+    - 若提供 tokenizer 与 max_new_tokens，则确保不超过生成 token 上限（再decode）。
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    s = text.strip()
+    # 去掉首尾标点
+    strip_chars = "，。！？；：,.!?:;、~··…—-\u3000\t\r\n"
+    s = s.strip(strip_chars)
+    # 去重片段（按中文逗号拆分）
+    parts = [p.strip(strip_chars) for p in s.split("，")]
+    dedup = []
+    seen = set()
+    for p in parts:
+        if not p:
+            continue
+        key = p
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(p)
+    s = "，".join(dedup) if dedup else text.strip(strip_chars)
+    # 兜底长度约束：若实际生成超过 max_new_tokens（以 tokenizer 为准），强制截断
+    if tokenizer is not None and isinstance(max_new_tokens, int) and max_new_tokens > 0:
+        try:
+            toks = tokenizer.encode(s, add_special_tokens=False)
+            if len(toks) > max_new_tokens:
+                toks = toks[:max_new_tokens]
+                s = tokenizer.decode(toks, skip_special_tokens=True).strip(strip_chars)
+        except Exception:
+            pass
+    return s
+
+
 def caption_batch(
     samples,
     model,
@@ -257,7 +340,8 @@ def caption_batch(
     max_new_tokens: int = 64,
     infer_bs: int = 2,
     use_amp: bool = True,
-    amp_dtype: str = "fp16",
+    amp_dtype: str = "bf16",
+    postprocess: bool = False,
 ):
     ## 备选prompt：请为商品图片生成精准中文描述：
     """批量生成图片描述，支持一次性批量推理以提速。
@@ -286,35 +370,90 @@ def caption_batch(
         # 加入生成前缀，避免模型回显输入
         chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         results = []
-        dev = getattr(model, 'device', None)
+        # 推理设备选择：若可用则强制使用 CUDA，以避免 CPU 生成导致 0% GPU 利用率
+        if torch.cuda.is_available():
+            dev = torch.device('cuda')
+        else:
+            # 回退：尝试读取模型参数设备，否则使用 CPU
+            try:
+                dev = next(model.parameters()).device
+            except Exception:
+                dev = torch.device('cpu')
         for start in tqdm.tqdm(range(0, len(samples), max(1, infer_bs)), desc="Captioning images, with ``generate``"):
             chunk = samples[start:start+max(1, infer_bs)]
             texts = [chat_text] * len(chunk)
             images = [s["image"] for s in chunk]
             inputs = processor(text=texts, images=images, return_tensors="pt")
+            # 确保输入移动到推理设备，以避免在 CPU 上生成导致慢速与 0% GPU 利用率
             if dev is not None:
                 inputs = {k: (v.to(dev) if hasattr(v, 'to') else v) for k, v in inputs.items()}
             with torch.inference_mode():
+                # 统一生成参数，加入终止标记与去重约束
+                tok = getattr(processor, 'tokenizer', None)
+                gen_kwargs = {
+                    'max_new_tokens': int(max_new_tokens),
+                    'do_sample': False,
+                    'no_repeat_ngram_size': 3,
+                    'repetition_penalty': 1.1,
+                }
+                # 仅在使用 beam search 时才启用 early_stopping，避免无效参数告警
+                if int(gen_kwargs.get('num_beams', 1)) > 1:
+                    gen_kwargs['early_stopping'] = True
+                if tok is not None:
+                    if getattr(tok, 'eos_token_id', None) is not None:
+                        gen_kwargs['eos_token_id'] = tok.eos_token_id
+                    if getattr(tok, 'pad_token_id', None) is not None:
+                        gen_kwargs['pad_token_id'] = tok.pad_token_id
                 # 推理侧可使用 autocast 降显存
-                if use_amp and torch.cuda.is_available():
-                    if amp_dtype.lower() == "bf16":
-                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                            out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+                try:
+                    if use_amp and torch.cuda.is_available():
+                        if amp_dtype.lower() == "bf16":
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                out = model.generate(**inputs, **gen_kwargs)
+                        else:
+                            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                out = model.generate(**inputs, **gen_kwargs)
                     else:
-                        with torch.autocast(device_type="cuda", dtype=torch.float16):
-                            out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-                else:
-                    out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+                        out = model.generate(**inputs, **gen_kwargs)
+                except RuntimeError as e:
+                    # OOM 兜底：减小批次或生成长度，逐个生成
+                    log.warning(f"[Infer] batch generate failed: {e}. Falling back to per-sample generation with shorter length.")
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+                    except Exception:
+                        pass
+                    out = []
+                    fb_kwargs = dict(gen_kwargs)
+                    fb_kwargs['max_new_tokens'] = max(8, min(32, int(gen_kwargs.get('max_new_tokens', 64))))
+                    for bi in range(len(chunk)):
+                        one_inputs = {k: (v[bi:bi+1] if hasattr(v, 'shape') else v) for k, v in inputs.items()}
+                        if use_amp and torch.cuda.is_available():
+                            if amp_dtype.lower() == "bf16":
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                    o = model.generate(**one_inputs, **fb_kwargs)
+                            else:
+                                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                    o = model.generate(**one_inputs, **fb_kwargs)
+                        else:
+                            o = model.generate(**one_inputs, **fb_kwargs)
+                        out.append(o[0])
             # 仅解码生成的新 token，避免包含原始对话文本
             in_ids = inputs.get("input_ids")
             if in_ids is not None:
                 for bi in range(len(chunk)):
                     gen_ids = out[bi][in_ids[bi].shape[0]:].detach().cpu()
                     t = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+                    if postprocess:
+                        t = _sanitize_text(t, getattr(processor, 'tokenizer', None), max_new_tokens)
                     results.append(str(t).strip())
             else:
                 decoded = processor.batch_decode(out, skip_special_tokens=True)
-                results.extend([str(t).strip() for t in decoded])
+                for t in decoded:
+                    if postprocess:
+                        t = _sanitize_text(t, getattr(processor, 'tokenizer', None), max_new_tokens)
+                    results.append(str(t).strip())
         return results
 
     # 回退：逐张调用 chat 接口（某些实现不支持批量 generate）
@@ -333,6 +472,35 @@ def caption_batch(
 
     # 最终兜底：返回占位文案
     return ["这是一张电商商品图片。"] * len(samples)
+
+# ---------------------------
+# 训练专用：展开每图的多条描述为独立样本
+# ---------------------------
+def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
+    """将每张图片的多条文本描述展开为多个样本。
+
+    输入样本形如：{"image_id": str, "image": PIL.Image, "text": Union[str, list[str], None]}
+    输出样本形如：{"image_id": str, "image": PIL.Image, "text": str}
+
+    - 当 text 为 list[str] 时：为同一张图的每条文本生成一个独立样本。
+    - 当 text 为 str 时：保持为单一样本。
+    - 当 text 缺失或为空：丢弃该图（训练阶段需要监督信号）。
+    """
+    expanded = []
+    for s in samples:
+        img_id = s.get("image_id")
+        img = s.get("image")
+        text = s.get("text")
+        if isinstance(text, list):
+            for t in text:
+                if isinstance(t, str) and len(t.strip()) > 0:
+                    expanded.append({"image_id": img_id, "image": img, "text": t.strip()})
+        elif isinstance(text, str) and len(text.strip()) > 0:
+            expanded.append({"image_id": img_id, "image": img, "text": text.strip()})
+        else:
+            # 无文本，训练阶段跳过
+            continue
+    return expanded
 
 # ---------------------------
 # 训练模板：分轮加载、占位训练与保存
@@ -456,6 +624,13 @@ def run_training_rounds(
             image_size=image_size,
             show_progress=show_progress,
         )
+        # 展开每图的多条描述为独立训练样本，并记录该轮最终样本量
+        expanded_samples = _expand_multi_text_samples(samples)
+        round_sample_count = len(expanded_samples)
+        log.info(f"[Train] Round {r+1}: loaded {len(samples)} images -> expanded to {round_sample_count} samples")
+        if round_sample_count == 0:
+            log.warning(f"[Train] Round {r+1}: no usable samples after expansion")
+            continue
         # # 过滤缺失文本的样本
         # samples = [s for s in samples if isinstance(s.get("text"), str) and len(s.get("text", "")) > 0]
         # if not samples:
@@ -463,9 +638,9 @@ def run_training_rounds(
         #     continue
 
         for epoch in range(epochs):
-            log.info(f"[Train] Epoch {epoch+1}/{epochs} on {len(samples)} samples")
-            for i in tqdm.tqdm(range(0, len(samples), train_bs), desc=f"Epoch {epoch+1}/{epochs}"):
-                batch = samples[i:i+train_bs]
+            log.info(f"[Train] Epoch {epoch+1}/{epochs} on {round_sample_count} samples")
+            for i in tqdm.tqdm(range(0, round_sample_count, train_bs), desc=f"Epoch {epoch+1}/{epochs}"):
+                batch = expanded_samples[i:i+train_bs]
                 if not batch:
                     continue
                 images = [s["image"] for s in batch]
@@ -518,27 +693,89 @@ def run_training_rounds(
                     model_engine.backward(loss)
                     model_engine.step()
                 global_step += 1
-                if global_step % 10 == 0:
-                    log.info(f"[Train] step={global_step}, loss={loss.item():.4f}")
+                # if global_step % 10 == 0:
+            log.info(f"[Train] step={global_step}, loss={loss.item():.4f}")
 
         # 该轮结束可做一次小样例推理检查
         warmup_n = min(2, len(samples))
         infer_model = (model_engine.module if model_engine is not None else model)
         # 切到 eval 模式，避免训练态下的随机性与回显
         infer_model.eval()
-        preds = caption_batch(samples[:warmup_n], infer_model, processor)
+        # Warmup 推理：显式限制生成长度、开启轻量后处理去重与去噪
+        preds = caption_batch(
+            samples[:warmup_n],
+            infer_model,
+            processor,
+            prompt="请为商品图片生成精准中文描述：",
+            max_new_tokens=64,
+            infer_bs=2,
+            use_amp=True,
+            amp_dtype="bf16",
+            postprocess=True,
+        )
         log.info(f"[Train] Warmup inference (LoRA): {preds}")
 
         # 保存样例图片并生成简易 HTML 预览（提取到 preview_utils.save_warmup_preview）
         html_path = save_warmup_preview(samples[:warmup_n], preds, save_dir, round_index=r+1)
         if html_path is None:
             log.warning("[Train] Warmup preview failed to build.")
+        # 每轮结束时输出最终样本总量
+        log.info(f"[Train] Round {r+1} final sample count: {round_sample_count}")
+
+        # 每轮结束：尽可能清理缓存与临时对象，恢复训练模式
+        try:
+            # 重置为训练模式（避免上一轮 warmup 将模型留在 eval 态）
+            if model_engine is not None:
+                model_engine.train()
+            else:
+                model.train()
+            # 清理推理侧的 KV 缓存（部分实现提供）
+            infer_mod = (model_engine.module if model_engine is not None else model)
+            if hasattr(infer_mod, "clear_kv_cache"):
+                try:
+                    infer_mod.clear_kv_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 删除本轮的临时变量引用，利于 GC 释放显存
+        for name in [
+            'expanded_samples', 'samples', 'preds', 'inputs', 'labels', 'out', 'images', 'targets', 'texts'
+        ]:
+            try:
+                del locals()[name]
+            except Exception:
+                pass
+        # 强制进行一次 CUDA 同步与显存清理
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        free_torch_memory()
 
     # 5) 保存 LoRA 适配器
     assert save_dir is not None and len(str(save_dir)) > 0
     save_target = (model_engine.module if model_engine is not None else model)
     save_target.save_pretrained(save_dir)
     log.info(f"[Train] LoRA adapter saved to: {save_dir}")
+
+    # 训练资源释放：删除大型对象并清理显存，防止与验证/测试相互影响
+    try:
+        del samples
+    except Exception:
+        pass
+    try:
+        del model_engine
+    except Exception:
+        pass
+    try:
+        del model
+        del base_model
+        del processor
+    except Exception:
+        pass
+    free_torch_memory()
 
 
 # ---------------------------
@@ -549,14 +786,14 @@ def run_validation(
     valid_jsonl: str,
     rounds: int,
     per_round_lines: int,
-    image_size: int = 448,
+    image_size: int = 224,
     show_progress: bool = True,
     local_model_dir: str = "/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
     lora_dir: str | None = None,
 
     infer_bs: int = 2,
     use_amp: bool = True,
-    amp_dtype: str = "fp16",
+    amp_dtype: str = "bf16",
     max_new_tokens: int = 64,
     model: torch.nn.Module | None = None,
     processor: AutoProcessor | None = None,
@@ -574,14 +811,21 @@ def run_validation(
     返回：
     - 简化版 CIDEr 分数（float）。
     """
-    # 允许外部传入已加载的模型/处理器以复用（避免重复加载）
+    # 要求外部传入已加载的模型/处理器以复用（避免重复加载）
     if model is None or processor is None:
-        if lora_dir and os.path.isdir(lora_dir):
-            base_model, processor = load_qwen_vl(local_model_dir)
-            model = PeftModel.from_pretrained(base_model, lora_dir)
+        raise ValueError("run_validation 需要传入已加载的 model 和 processor；请在外部完成一次性加载并复用。")
+    # 显式将模型放到 CUDA（如果可用），避免 CPU 上的推理导致 0% GPU 利用率
+    try:
+        if torch.cuda.is_available():
+            model.to(torch.device('cuda'))
             model.eval()
-        else:
-            model, processor = load_qwen_vl(local_model_dir)
+            try:
+                dev = next(model.parameters()).device
+                log.info(f"[Valid] Model device after to(cuda): {dev}")
+            except Exception:
+                pass
+    except Exception as e:
+        log.info(f"[Valid] model.to(cuda) skipped: {e}")
     all_preds = []
     all_refs = []
     for r in range(rounds):
@@ -604,8 +848,33 @@ def run_validation(
         all_refs.extend(refs)
         log.info(f"[Valid] processed {len(all_preds)} samples so far")
 
+        # 每轮验证结束后清理缓存与显存
+        try:
+            infer_mod = getattr(model, 'module', model)
+            if hasattr(infer_mod, 'clear_kv_cache'):
+                try:
+                    infer_mod.clear_kv_cache()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for name in ['batch', 'preds', 'refs']:
+            try:
+                del locals()[name]
+            except Exception:
+                pass
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        free_torch_memory()
+
     cider = compute_cider(all_preds, all_refs)
     log.info(f"[Valid] Simplified CIDEr: {cider:.4f}")
+
+    # 不释放外部传入的模型/处理器，仅清理缓存
+    free_torch_memory()
     return cider
 
 
@@ -618,14 +887,14 @@ def run_test(
     rounds: int,
     per_round_lines: int,
     output_jsonl: str,
-    image_size: int = 448,
+    image_size: int = 224,
     show_progress: bool = True,
     local_model_dir: str = "/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
     lora_dir: str | None = None,
 
     infer_bs: int = 2,
     use_amp: bool = True,
-    amp_dtype: str = "fp16",
+    amp_dtype: str = "bf16",
     max_new_tokens: int = 64,
     model: torch.nn.Module | None = None,
     processor: AutoProcessor | None = None,
@@ -649,14 +918,21 @@ def run_test(
     os.makedirs(out_dir or ".", exist_ok=True)
     print(f"[Test] output_jsonl: {output_jsonl}")
 
-    # 允许外部传入已加载的模型/处理器以复用（避免重复加载）
+    # 要求外部传入已加载的模型/处理器以复用（避免重复加载）
     if model is None or processor is None:
-        if lora_dir and os.path.isdir(lora_dir):
-            base_model, processor = load_qwen_vl(local_model_dir)
-            model = PeftModel.from_pretrained(base_model, lora_dir)
+        raise ValueError("run_test 需要传入已加载的 model 和 processor；请在外部完成一次性加载并复用。")
+    # 显式将模型放到 CUDA（如果可用），避免 CPU 上的推理导致 0% GPU 利用率
+    try:
+        if torch.cuda.is_available():
+            model.to(torch.device('cuda'))
             model.eval()
-        else:
-            model, processor = load_qwen_vl(local_model_dir)
+            try:
+                dev = next(model.parameters()).device
+                log.info(f"[Test] Model device after to(cuda): {dev}")
+            except Exception:
+                pass
+    except Exception as e:
+        log.info(f"[Test] model.to(cuda) skipped: {e}")
     count = 0
     with open(output_jsonl, "w", encoding="utf-8") as f:
         for r in range(rounds):
@@ -680,7 +956,32 @@ def run_test(
                 count += 1
             log.info(f"[Test] wrote {count} predictions so far")
 
+            # 每轮测试结束后清理缓存与显存
+            try:
+                infer_mod = getattr(model, 'module', model)
+                if hasattr(infer_mod, 'clear_kv_cache'):
+                    try:
+                        infer_mod.clear_kv_cache()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            for name in ['batch', 'preds']:
+                try:
+                    del locals()[name]
+                except Exception:
+                    pass
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            free_torch_memory()
+
     log.info(f"[Test] saved predictions to {output_jsonl} (total {count})")
+
+    # 不释放外部传入的模型/处理器，仅进行一次显存清理
+    free_torch_memory()
 
 
 if __name__ == "__main__":
@@ -707,8 +1008,8 @@ if __name__ == "__main__":
     # run_training_rounds(
     #     train_tsv=train_tsv,
     #     train_jsonl=train_jsonl,
-    #     rounds=1,
-    #     per_round_lines=100,
+    #     rounds=3,
+    #     per_round_lines=1000,
     #     image_size=IMAGE_SIZE,
     #     show_progress=True,
     #     save_dir=lora_save_dir,
@@ -725,32 +1026,53 @@ if __name__ == "__main__":
 
     # 2) 验证：按轮次/每轮行数加载，计算简化版 CIDEr
     # 提前加载并复用模型与处理器，避免重复初始化耗时
-    base_model, base_processor = load_qwen_vl("/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct")
-    infer_model = PeftModel.from_pretrained(base_model, lora_save_dir) if os.path.isdir(lora_save_dir) else base_model
-    infer_model.eval()
-
-    cider = run_validation(
-        valid_tsv=valid_tsv,
-        valid_jsonl=valid_jsonl,
-        rounds=1,
-        per_round_lines=100,
-        image_size=IMAGE_SIZE,
-        show_progress=True,
-        local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
-        lora_dir=lora_save_dir,
-        # 推理加速参数（可按显存情况调整）
-        infer_bs=4,
-        use_amp=True,
-        amp_dtype="bf16",
-        max_new_tokens=48,
-        model=infer_model,
-        processor=base_processor,
+    # 一次性加载并优化推理模型与处理器，后续验证/测试复用以避免重复加载
+    base_model, base_processor = load_qwen_vl(
+        "/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
+        for_training=False,
     )
-    log.info(f"Validation (simplified) CIDEr: {cider:.4f}")
-    print("\n\n")
+    infer_model = PeftModel.from_pretrained(base_model, lora_save_dir) if os.path.isdir(lora_save_dir) else base_model
+    try:
+        if torch.cuda.is_available():
+            infer_model.to(torch.device('cuda'))
+            infer_model.eval()
+            try:
+                dev = next(infer_model.parameters()).device
+                log.info(f"[Entry] Inference model device: {dev}")
+            except Exception:
+                pass
+    except Exception as e:
+        log.info(f"[Entry] infer_model.to(cuda) skipped: {e}")
+
+    # 清理训练阶段显存，避免与验证共享导致崩溃
+    free_torch_memory()
+
+    # cider = run_validation(
+    #     valid_tsv=valid_tsv,
+    #     valid_jsonl=valid_jsonl,
+    #     rounds=1,
+    #     per_round_lines=100,
+    #     image_size=IMAGE_SIZE,
+    #     show_progress=True,
+    #     local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
+    #     lora_dir=lora_save_dir,
+    #     # 推理加速参数（可按显存情况调整）
+    #     infer_bs=4,
+    #     use_amp=True,
+    #     amp_dtype="bf16",
+    #     max_new_tokens=48,
+    #     # 复用已加载模型与处理器，避免重复加载
+    #     model=infer_model,
+    #     processor=base_processor,
+    # )
+    # log.info(f"Validation (simplified) CIDEr: {cider:.4f}")
+    # print("\n\n")
 
     # 3) 测试：分批生成占位文本，存为 example_pred.jsonl 风格
     output_jsonl = os.path.join(base_dir, f"{version_symb}.jsonl")
+    # 清理验证阶段显存，切换到测试
+    free_torch_memory()
+
     run_test(
         test_tsv=test_tsv,
         test_jsonl=test_jsonl,
@@ -766,6 +1088,7 @@ if __name__ == "__main__":
         use_amp=True,
         amp_dtype="bf16",
         max_new_tokens=48,
+        # 复用已加载模型与处理器，避免重复加载
         model=infer_model,
         processor=base_processor,
     )

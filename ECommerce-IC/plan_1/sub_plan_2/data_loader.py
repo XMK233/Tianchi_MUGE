@@ -51,6 +51,7 @@ def _decode_base64_image(b64_str):
         img = img.convert("RGB")
         return img
     except Exception as e:
+        log.info("[DataLoader] try-block failed in _decode_base64_image")
         log.warning(f"Failed to decode base64 image: {e}")
         return None
 
@@ -59,6 +60,7 @@ def _resize_image(img, size):
     try:
         return img.resize((size, size), Image.BILINEAR)
     except Exception:
+        log.info("[DataLoader] try-block failed in _resize_image")
         return img
 
 
@@ -119,6 +121,7 @@ def _build_caption_index(jsonl_path, target_ids=None, show_progress=True):
                 try:
                     obj = json.loads(line)
                 except Exception:
+                    log.info("[DataLoader] try-block failed in _build_caption_index: parse json line")
                     log.warning(f"Failed to parse JSON line: {line}")
                     continue
                 img_id = obj.get("img_id") or obj.get("image_id")
@@ -186,6 +189,7 @@ def default_collate(samples, processor=None):
             inputs["image_ids"] = ids
             return inputs
         except Exception as e:
+            log.info("[DataLoader] try-block failed in default_collate: processor(text, images)")
             log.warning(f"Processor collate failed, falling back to raw lists: {e}")
     return {"image_ids": ids, "images": images, "texts": texts}
 

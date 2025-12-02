@@ -24,6 +24,7 @@ try:
         ICTsvJsonlDataset,
     )
 except Exception:
+    logging.getLogger("pipeline_template").info("[Pipeline] try-block failed: relative import data_loader")
     import sys
     sys.path.append(os.path.dirname(__file__))
     from data_loader import (
@@ -38,6 +39,7 @@ log = logging.getLogger("pipeline_template")
 try:
     from .metrics import compute_cider
 except Exception:
+    logging.getLogger("pipeline_template").info("[Pipeline] try-block failed: relative import metrics")
     import sys
     sys.path.append(os.path.dirname(__file__))
     from metrics import compute_cider

@@ -32,6 +32,7 @@ def _to_pil_rgb(obj):
                     pass
             return obj
     except Exception:
+        log.info("[Preview] try-block failed in _to_pil_rgb: PIL branch")
         pass
     # Torch Tensor
     try:
@@ -52,6 +53,7 @@ def _to_pil_rgb(obj):
                 arr = np.stack([arr] * 3, axis=-1)
             return Image.fromarray(arr).convert("RGB")
     except Exception:
+        log.info("[Preview] try-block failed in _to_pil_rgb: torch branch")
         pass
     # NumPy 数组或带 numpy() 方法对象
     try:
@@ -76,11 +78,13 @@ def _to_pil_rgb(obj):
                 arr = np.stack([arr] * 3, axis=-1)
             return Image.fromarray(arr).convert("RGB")
     except Exception:
+        log.info("[Preview] try-block failed in _to_pil_rgb: numpy branch")
         pass
     # 最后尝试直接 fromarray
     try:
         return Image.fromarray(obj).convert("RGB")
     except Exception:
+        log.info("[Preview] try-block failed in _to_pil_rgb: fromarray fallback")
         return None
 
 
@@ -136,6 +140,6 @@ def save_warmup_preview(samples, preds, save_dir: str | None, round_index: int) 
         log.info(f"[Train] Warmup preview saved: {html_path}")
         return html_path
     except Exception as e:
+        log.info("[Preview] try-block failed in save_warmup_preview: building HTML and assets")
         log.warning(f"[Train] Failed to build warmup preview: {e}")
         return None
-
