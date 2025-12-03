@@ -17,7 +17,6 @@ import json
 import random
 import logging
 import warnings
-import argparse
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # HF & Torch（直接导入，不使用异常捕获）
@@ -168,7 +167,6 @@ def load_qwen_vl(local_dir: str, for_training: bool = False):
         # branch_log()
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
 
     resolved_dir = _resolve_model_dir(local_dir)
 
@@ -239,6 +237,136 @@ def load_qwen_vl(local_dir: str, for_training: bool = False):
     model.eval()
     return model, processor
 
+
+# def _caption_one_image(image, model, processor, prompt: str = "请用中文简洁描述这张图片。") -> str:
+#     """对单张图片生成中文描述。
+
+#     参数：
+#     - image：PIL.Image 或 numpy 数组形式的图像。
+#     - model：已加载的多模态模型实例。
+#     - processor：与模型配套的处理器，用于构造输入与解码输出。
+#     - prompt：文本提示，指导生成的风格与内容。
+#     返回：
+#     - 生成的中文描述字符串；必要时返回兜底占位文案。
+#     """
+#     # 1) 使用官方聊天模板，确保在文本中插入图像占位符（如 <|image_1|>）
+#     messages = [
+#         {
+#             "role": "user",
+#             "content": [
+#                 {"type": "image"},
+#                 {"type": "text", "text": prompt},
+#             ],
+#         }
+#     ]
+#     # 不直接 tokenize，这里让 processor 统一打包 text 与 images
+#     # 加入生成前缀，避免模型回显输入
+#     chat_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+#     inputs = processor(text=chat_text, images=[image], return_tensors="pt")
+#     dev = getattr(model, 'device', None)
+#     if dev is not None:
+#         branch_log()
+#         inputs = {k: (v.to(dev) if hasattr(v, 'to') else v) for k, v in inputs.items()}
+#     if hasattr(model, 'generate'):
+#         branch_log()
+#         with torch.inference_mode():
+#             tok = getattr(processor, 'tokenizer', None)
+#             gen_kwargs = {
+#                 'max_new_tokens': 64,
+#                 'do_sample': False,
+#                 'no_repeat_ngram_size': 3,
+#                 'repetition_penalty': 1.1,
+#                 'early_stopping': True,
+#             }
+#             if tok is not None:
+#                 branch_log()
+#                 if getattr(tok, 'eos_token_id', None) is not None:
+#                     branch_log()
+#                     gen_kwargs['eos_token_id'] = tok.eos_token_id
+#                 if getattr(tok, 'pad_token_id', None) is not None:
+#                     branch_log()
+#                     gen_kwargs['pad_token_id'] = tok.pad_token_id
+#             out = model.generate(**inputs, **gen_kwargs)
+#         # 仅解码生成的新 token，避免包含原始对话文本
+#         in_ids = inputs.get("input_ids")
+#         if in_ids is not None:
+#             branch_log()
+#             gen_ids = out[0][in_ids[0].shape[0]:].detach().cpu()
+#             text = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+#             text = _sanitize_text(text, tok, 64)
+#             return str(text).strip()
+#         else:
+#             branch_log()
+#             decoded = processor.batch_decode(out, skip_special_tokens=True)
+#             t = _sanitize_text(decoded[0], tok, 64)
+#             return str(t).strip()
+
+#     # 2) 回退：兼容不同 chat 签名
+#     if hasattr(model, 'chat'):
+#         branch_log()
+#         tok = getattr(processor, 'tokenizer', None)
+#         if tok is not None:
+#             branch_log()
+#             resp = model.chat(tok, query=prompt, images=[image], history=None)
+#             if isinstance(resp, (tuple, list)):
+#                 branch_log()
+#                 return str(resp[0]).strip()
+#             return str(resp).strip()
+#         else:
+#             branch_log()
+#             resp = model.chat(query=prompt, images=[image])
+#             if isinstance(resp, (tuple, list)):
+#                 branch_log()
+#                 return str(resp[0]).strip()
+#             return str(resp).strip()
+
+#     # 3) 最终兜底占位，避免崩溃
+#     return "这是一张电商商品图片。"
+
+
+# def _sanitize_text(text: str, tokenizer=None, max_new_tokens: int | None = None) -> str:
+#     """轻量后处理：去除首尾多余标点/空白、简单去重片段、长度兜底约束。
+
+#     - 去除首尾中文/英文常见标点和空白；
+#     - 按中文逗号分段，移除连续重复片段（保留顺序）；
+#     - 若提供 tokenizer 与 max_new_tokens，则确保不超过生成 token 上限（再decode）。
+#     """
+#     if not isinstance(text, str):
+#         branch_log()
+#         text = str(text)
+#     s = text.strip()
+#     # 去掉首尾标点
+#     strip_chars = "，。！？；：,.!?:;、~··…—-\u3000\t\r\n"
+#     s = s.strip(strip_chars)
+#     # 去重片段（按中文逗号拆分）
+#     parts = [p.strip(strip_chars) for p in s.split("，")]
+#     dedup = []
+#     seen = set()
+#     for p in parts:
+#         if not p:
+#             branch_log()
+#             continue
+#         key = p
+#         if key in seen:
+#             branch_log()
+#             continue
+#         seen.add(key)
+#         dedup.append(p)
+#     s = "，".join(dedup) if dedup else text.strip(strip_chars)
+#     # 兜底长度约束：若实际生成超过 max_new_tokens（以 tokenizer 为准），强制截断
+#     if tokenizer is not None and isinstance(max_new_tokens, int) and max_new_tokens > 0:
+#         branch_log()
+#         try:
+#             toks = tokenizer.encode(s, add_special_tokens=False)
+#             if len(toks) > max_new_tokens:
+#                 branch_log()
+#                 toks = toks[:max_new_tokens]
+#                 s = tokenizer.decode(toks, skip_special_tokens=True).strip(strip_chars)
+#         except Exception:
+#             except_log("sanitize_text tokenizer fallback")
+#     return s
+
+
 def caption_batch(
     samples,
     model,
@@ -264,6 +392,11 @@ def caption_batch(
     if not samples:
         branch_log()
         return []
+    # # 逐张生成，避免不同模型对批量多图的接口差异
+    # rst = []
+    # for s in tqdm.tqdm(samples, desc="Captioning images"):
+    #     rst.append(_caption_one_image(s["image"], model, processor, prompt=prompt))
+    # return rst
     # 若模型支持批量 generate，则一次性处理整批（显著减少 Python 循环与 I/O 开销）
     if hasattr(model, 'generate'):
         # branch_log()
@@ -330,13 +463,67 @@ def caption_batch(
                 else:
                     # branch_log()
                     out = model.generate(**inputs, **gen_kwargs)
+                # except RuntimeError as e:
+                #     # OOM 兜底：减小批次或生成长度，逐个生成
+                #     log.warning(f"[Infer] batch generate failed: {e}. Falling back to per-sample generation with shorter length.")
+                #     if torch.cuda.is_available():
+                #         branch_log()
+                #         torch.cuda.empty_cache()
+                #         torch.cuda.ipc_collect()
+                #     out = []
+                #     fb_kwargs = dict(gen_kwargs)
+                #     fb_kwargs['max_new_tokens'] = max(8, min(32, int(gen_kwargs.get('max_new_tokens', 64))))
+                #     for bi in range(len(chunk)):
+                #         one_inputs = {k: (v[bi:bi+1] if hasattr(v, 'shape') else v) for k, v in inputs.items()}
+                #         if use_amp and torch.cuda.is_available():
+                #             branch_log()
+                #             if amp_dtype.lower() == "bf16":
+                #                 branch_log()
+                #                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                #                     o = model.generate(**one_inputs, **fb_kwargs)
+                #             else:
+                #                 branch_log()
+                #                 with torch.autocast(device_type="cuda", dtype=torch.float16):
+                #                     o = model.generate(**one_inputs, **fb_kwargs)
+                #         else:
+                #             branch_log()
+                #             o = model.generate(**one_inputs, **fb_kwargs)
+                #         out.append(o[0])
             # 仅解码生成的新 token，避免包含原始对话文本
             in_ids = inputs.get("input_ids")
+            # if in_ids is not None:
+            # branch_log()
             for bi in range(len(chunk)):
                 gen_ids = out[bi][in_ids[bi].shape[0]:].detach().cpu()
                 t = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+                # if postprocess:
+                #     t = _sanitize_text(t, getattr(processor, 'tokenizer', None), max_new_tokens)
                 results.append(str(t).strip())
+            # else:
+            #     branch_log()
+            #     decoded = processor.batch_decode(out, skip_special_tokens=True)
+            #     for t in decoded:
+            #         # if postprocess:
+            #         #     t = _sanitize_text(t, getattr(processor, 'tokenizer', None), max_new_tokens)
+            #         results.append(str(t).strip())
         return results
+
+    # # 回退：逐张调用 chat 接口（某些实现不支持批量 generate）
+    # if hasattr(model, 'chat'):
+    #     branch_log()
+    #     results = []
+    #     tok = getattr(processor, 'tokenizer', None)
+    #     for s in tqdm.tqdm(samples, desc="Captioning images, with ``chat``"):
+    #         img = s["image"]
+    #         if tok is not None:
+    #             branch_log()
+    #             resp = model.chat(tok, query=prompt, images=[img], history=None)
+    #         else:
+    #             branch_log()
+    #             resp = model.chat(query=prompt, images=[img])
+    #         text = resp[0] if isinstance(resp, (tuple, list)) else resp
+    #         results.append(str(text).strip())
+    #     return results
 
     # 最终兜底：返回占位文案
     return ["这是一张电商商品图片。"] * len(samples)
@@ -432,7 +619,6 @@ def run_training_rounds(
         target_modules=target_modules,
     )
     model = get_peft_model(base_model, lconf)
-    model.gradient_checkpointing_enable()
     model.train()
 
     # 统计 LoRA 可训练参数与内存占用
@@ -453,7 +639,7 @@ def run_training_rounds(
             log.info(f"[GPU{idx}] allocated={alloc_mb:.2f} MB | reserved={reserv_mb:.2f} MB")
 
     # 3) 优化器与（可选）DeepSpeed 初始化
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, fused=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     if use_deepspeed:
         ds_config = {
@@ -500,6 +686,11 @@ def run_training_rounds(
         if round_sample_count == 0:
             log.warning(f"[Train] Round {r+1}: no usable samples after expansion")
             continue
+        # # 过滤缺失文本的样本
+        # samples = [s for s in samples if isinstance(s.get("text"), str) and len(s.get("text", "")) > 0]
+        # if not samples:
+        #     log.info(f"[Train] Round {r+1}: no usable samples (missing text)")
+        #     continue
 
         for epoch in range(epochs):
             log.info(f"[Train] Epoch {epoch+1}/{epochs} on {round_sample_count} samples")
@@ -519,34 +710,18 @@ def run_training_rounds(
                     t = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
                     texts.append(t)
 
-                # 预处理与搬运：启用 pinned memory 与非阻塞搬运以提升 H2D 吞吐
                 inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
-                for k, v in list(inputs.items()):
-                    if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                        inputs[k] = v.pin_memory()
-                inputs = {k: (v.to(device, non_blocking=True) if hasattr(v, "to") else v) for k, v in inputs.items()}
-
-                # 仅监督 assistant 段落：向量化计算用户段长度并屏蔽其之前的 label
-                # 构造用户侧模板（仅用户图+文本提示）并一次性 tokenizer，避免 per-sample 重复开销
-                texts_user = []
-                for _img in images:
+                inputs = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
+                labels = inputs["input_ids"].clone()
+                # 仅监督 assistant 段落：计算用户段长度并屏蔽其之前的 label
+                for j, img in enumerate(images):
                     msg_user = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
                     txt_user = processor.apply_chat_template(msg_user, tokenize=False, add_generation_prompt=False)
-                    texts_user.append(txt_user)
-                user_batch = processor(text=texts_user, images=images, return_tensors="pt", padding=True)
-                user_mask = user_batch.get("attention_mask")
-
-                labels = inputs["input_ids"].clone()
-                if user_mask is not None:
-                    # 使用 attention_mask 计算真实用户段长度（去除 padding）
-                    user_lens = user_mask.sum(dim=1).tolist()
-                else:
-                    # 回退：使用未掩蔽的 user input_ids 长度（可能含 padding）
-                    user_lens = [user_batch["input_ids"][j].shape[0] for j in range(len(images))]
-
-                for j, user_len in enumerate(user_lens):
+                    ids_user = processor(text=txt_user, images=[img], return_tensors="pt")["input_ids"][0].to(device)
+                    user_len = ids_user.shape[0]
                     seq_len = labels[j].shape[0]
-                    labels[j, :min(int(user_len), int(seq_len))] = -100
+                    # 屏蔽用户段与 padding
+                    labels[j, :min(user_len, seq_len)] = -100
                 if "attention_mask" in inputs:
                     labels[inputs["attention_mask"] == 0] = -100
                 inputs["labels"] = labels
@@ -618,7 +793,7 @@ def run_training_rounds(
                 except_log("clear_kv_cache failed in training round end")
         # 删除本轮的临时变量引用，利于 GC 释放显存
         for name in [
-            'expanded_samples', 'samples', 'preds', 'inputs', 'labels', 'out', 'images', 'targets', 'texts', 'texts_user', 'user_batch'
+            'expanded_samples', 'samples', 'preds', 'inputs', 'labels', 'out', 'images', 'targets', 'texts'
         ]:
             if name in locals():
                 del locals()[name]
@@ -824,19 +999,10 @@ def run_test(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run training/validation/test pipeline")
-    parser.add_argument(
-        "--mode",
-        choices=["train", "infer"],
-        default="infer",
-        help="运行模式：train 训练，infer 验证与测试（默认 infer）",
-    )
-    args = parser.parse_args()
-
     version_symb = "v3"
 
-    mode = args.mode
-    assert mode in {"train", "infer"}, "invalid mode"
+    mode = "infer"
+    assert mode in {"train", "infer"}, "invalid model"
 
     logging.basicConfig(level=logging.INFO)
 
@@ -869,10 +1035,9 @@ if __name__ == "__main__":
             lora_r=4,
             lora_alpha=8,
             lora_dropout=0.05,
-            train_bs=4,
+            train_bs=2,
             lr=5e-5,
             epochs=1,
-            gradient_accumulation_steps = 4
         )
         print("\n\n")
     else:
@@ -946,14 +1111,3 @@ if __name__ == "__main__":
             processor=base_processor,
         )
         print("\n\n")
-
-
-## 部分提速尝试：
-# 已做改进
-
-# - 启用 cudnn.benchmark ，让卷积在固定尺寸下自动选择最快内核。
-# - 使用 pinned memory 与非阻塞搬运：对 CPU 张量调用 pin_memory() ，用 to(device, non_blocking=True) 提升 H2D吞吐。
-# - 将“用户段模板”批量一次性 tokenizer，避免逐样本重复 CPU 开销。
-# - 保持 AMP（ bf16 / fp16 ）与 TF32 开启以提高吞吐。
-# 这些改动减少了 CPU 侧准备与传输开销，能显著提升训练时 GPU 的占用与稳定性。
-

@@ -360,9 +360,12 @@ def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
         img = s.get("image")
         text = s.get("text")
         if isinstance(text, list):
-            for t in text:
-                if isinstance(t, str) and len(t.strip()) > 0:
-                    expanded.append({"image_id": img_id, "image": img, "text": t.strip()})
+            # 仅随机选择至多 3 条有效文本，减少每图样本数
+            valid_texts = [t.strip() for t in text if isinstance(t, str) and len(t.strip()) > 0]
+            if valid_texts:
+                select_k = min(1, len(valid_texts))
+                for t in random.sample(valid_texts, k=select_k):
+                    expanded.append({"image_id": img_id, "image": img, "text": t})
         elif isinstance(text, str) and len(text.strip()) > 0:
             expanded.append({"image_id": img_id, "image": img, "text": text.strip()})
         else:
@@ -393,6 +396,7 @@ def run_training_rounds(
     use_deepspeed: bool = True,
     deepspeed_stage: int = 2,
     gradient_accumulation_steps: int = 1,
+    resume: bool = True,
 ):
     """用 LoRA 做真实 SFT 训练并保存适配器。
 
@@ -418,7 +422,29 @@ def run_training_rounds(
     # 1) 加载基础 VL 模型与处理器
     base_model, processor = load_qwen_vl(local_model_dir, for_training=True)
 
-    # 2) 注入 LoRA 适配器（覆盖常见的注意力/MLP投影层）
+    # 2) 注入/恢复 LoRA 适配器（覆盖常见的注意力/MLP投影层）
+    def _find_latest_round_ckpt(dir_path: str):
+        try:
+            entries = os.listdir(dir_path)
+        except Exception:
+            return None
+        candidates = []
+        for name in entries:
+            if name.startswith("round_"):
+                try:
+                    n = int(name.split("_")[1])
+                except Exception:
+                    continue
+                ckpt_dir = os.path.join(dir_path, name)
+                if os.path.isdir(ckpt_dir) and os.path.exists(os.path.join(ckpt_dir, "adapter_config.json")):
+                    candidates.append((n, ckpt_dir))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0]
+
+    latest = _find_latest_round_ckpt(save_dir) if (resume and save_dir) else None
+
     target_modules = [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -431,7 +457,33 @@ def run_training_rounds(
         task_type="CAUSAL_LM",
         target_modules=target_modules,
     )
-    model = get_peft_model(base_model, lconf)
+
+    if latest is not None:
+        latest_round, latest_dir = latest
+        log.info(f"[Train] Resuming from latest ckpt: round {latest_round} @ {latest_dir}")
+        # 为保证续训时 LoRA 参数处于可训练状态：
+        # 1) 先构建同结构的 LoRA 模型
+        model = get_peft_model(base_model, lconf)
+        # 2) 加载最新 ckpt 到适配器，并显式标记为可训练
+        try:
+            model.load_adapter(latest_dir, adapter_name="default", is_trainable=True)
+            if hasattr(model, "set_adapter"):
+                model.set_adapter("default")
+            # 某些版本提供 enable_adapter_layers 接口，尝试开启
+            if hasattr(model, "enable_adapter_layers"):
+                try:
+                    model.enable_adapter_layers()
+                except Exception:
+                    pass
+        except Exception:
+            except_log("load_adapter failed; falling back to from_pretrained")
+            # 兜底：直接从 ckpt 构建 PeftModel（可能需要额外设置以确保可训练）
+            model = PeftModel.from_pretrained(base_model, latest_dir)
+        start_round_idx = latest_round  # 从下一轮开始（round 是 1-based）
+    else:
+        model = get_peft_model(base_model, lconf)
+        start_round_idx = 0
+
     model.gradient_checkpointing_enable()
     model.train()
 
@@ -480,7 +532,24 @@ def run_training_rounds(
     prompt = "请为商品图片生成精准中文描述："
     global_step = 0
 
-    for r in range(rounds):
+    # 若已训练到或超过总轮次，直接退出
+    if start_round_idx >= rounds:
+        log.info(f"[Train] Already completed {rounds} rounds; nothing to do.")
+        # 保存一次当前适配器到顶层目录，保证可用
+        save_target = (model if model_engine is None else model_engine.module)
+        try:
+            save_target.save_pretrained(save_dir)
+            log.info(f"[Train] LoRA adapter saved to: {save_dir}")
+        except Exception:
+            except_log("save_pretrained at early-exit failed")
+        # 释放资源
+        for name in ['model_engine', 'model', 'base_model', 'processor']:
+            if name in locals():
+                del locals()[name]
+        free_torch_memory()
+        return
+
+    for r in range(start_round_idx, rounds):
         start = r * per_round_lines
         log.info(f"[Train] Round {r+1}/{rounds} | lines: {per_round_lines} @ start {start}")
 
@@ -520,7 +589,14 @@ def run_training_rounds(
                     texts.append(t)
 
                 # 预处理与搬运：启用 pinned memory 与非阻塞搬运以提升 H2D 吞吐
-                inputs = processor(text=texts, images=images, return_tensors="pt", padding=True)
+                inputs = processor(
+                    text=texts,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
                 for k, v in list(inputs.items()):
                     if isinstance(v, torch.Tensor) and v.device.type == "cpu":
                         inputs[k] = v.pin_memory()
@@ -533,7 +609,14 @@ def run_training_rounds(
                     msg_user = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
                     txt_user = processor.apply_chat_template(msg_user, tokenize=False, add_generation_prompt=False)
                     texts_user.append(txt_user)
-                user_batch = processor(text=texts_user, images=images, return_tensors="pt", padding=True)
+                user_batch = processor(
+                    text=texts_user,
+                    images=images,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
                 user_mask = user_batch.get("attention_mask")
 
                 labels = inputs["input_ids"].clone()
@@ -551,29 +634,106 @@ def run_training_rounds(
                     labels[inputs["attention_mask"] == 0] = -100
                 inputs["labels"] = labels
 
-                if model_engine is None:
-                    # branch_log()
-                    optimizer.zero_grad(set_to_none=True)
-                    if use_amp and device.type == "cuda":
-                        if amp_dtype.lower() == "bf16":
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                out = model(**inputs)
+                try:
+                    if model_engine is None:
+                        # branch_log()
+                        optimizer.zero_grad(set_to_none=True)
+                        if use_amp and device.type == "cuda":
+                            if amp_dtype.lower() == "bf16":
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                    out = model(**inputs)
+                            else:
+                                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                    out = model(**inputs)
                         else:
-                            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                out = model(**inputs)
+                            out = model(**inputs)
+                        loss = out.loss
+                        loss.backward()
+                        optimizer.step()
                     else:
-                        out = model(**inputs)
-                    loss = out.loss
-                    loss.backward()
-                    optimizer.step()
-                else:
-                    # branch_log()
-                    # DeepSpeed 引擎前向/反向/步进
-                    # DeepSpeed 路径按照 DS 配置控制混合精度，不再套 torch.autocast，避免双重设置
-                    out = model_engine(**inputs)
-                    loss = out.loss
-                    model_engine.backward(loss)
-                    model_engine.step()
+                        # branch_log()
+                        # DeepSpeed 引擎前向/反向/步进
+                        # DeepSpeed 路径按照 DS 配置控制混合精度，不再套 torch.autocast，避免双重设置
+                        model_engine.zero_grad()
+                        out = model_engine(**inputs)
+                        loss = out.loss
+                        model_engine.backward(loss)
+                        model_engine.step()
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                    msg = str(e).lower()
+                    if "out of memory" in msg or "cuda error: out of memory" in msg:
+                        except_log("OOM during training step; applying fallback")
+                        # 释放当前图与缓存
+                        for name in ["out", "loss", "inputs", "labels", "user_batch"]:
+                            if name in locals():
+                                del locals()[name]
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.ipc_collect()
+                        # 尝试将当前批次拆分为两半依次训练，以降低峰值显存
+                        if len(batch) >= 2:
+                            half = len(batch) // 2
+                            sub_batches = [batch[:half], batch[half:]]
+                            for sub in sub_batches:
+                                sub_images = [s["image"] for s in sub]
+                                sub_targets = [s.get("text") or "" for s in sub]
+                                sub_texts = []
+                                for tgt in sub_targets:
+                                    messages = [
+                                        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]},
+                                        {"role": "assistant", "content": [{"type": "text", "text": tgt}]},
+                                    ]
+                                    t = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                                    sub_texts.append(t)
+                                sub_inputs = processor(
+                                    text=sub_texts,
+                                    images=sub_images,
+                                    return_tensors="pt",
+                                    padding=True,
+                                    truncation=True,
+                                    max_length=384,
+                                )
+                                for k, v in list(sub_inputs.items()):
+                                    if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                                        sub_inputs[k] = v.pin_memory()
+                                sub_inputs = {k: (v.to(device, non_blocking=True) if hasattr(v, "to") else v) for k, v in sub_inputs.items()}
+
+                                try:
+                                    if model_engine is None:
+                                        optimizer.zero_grad(set_to_none=True)
+                                        if use_amp and device.type == "cuda":
+                                            if amp_dtype.lower() == "bf16":
+                                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                                    sub_out = model(**sub_inputs)
+                                            else:
+                                                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                                    sub_out = model(**sub_inputs)
+                                        else:
+                                            sub_out = model(**sub_inputs)
+                                        sub_loss = sub_out.loss
+                                        sub_loss.backward()
+                                        optimizer.step()
+                                    else:
+                                        model_engine.zero_grad()
+                                        sub_out = model_engine(**sub_inputs)
+                                        sub_loss = sub_out.loss
+                                        model_engine.backward(sub_loss)
+                                        model_engine.step()
+                                except Exception:
+                                    except_log("Fallback half-batch failed; skipping this sub-batch")
+                                finally:
+                                    for name in ["sub_out", "sub_loss", "sub_inputs"]:
+                                        if name in locals():
+                                            del locals()[name]
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                            # 跳过原批次，继续下一批
+                            continue
+                        else:
+                            # 无法拆分，直接跳过该批次
+                            continue
+                    else:
+                        raise
                 global_step += 1
                 # if global_step % 10 == 0:
             log.info(f"[Train] step={global_step}, loss={loss.item():.4f}")
@@ -604,6 +764,21 @@ def run_training_rounds(
         # 每轮结束时输出最终样本总量
         log.info(f"[Train] Round {r+1} final sample count: {round_sample_count}")
 
+        # 每轮结束：保存 ckpt 并记录最新 round
+        ckpt_dir = os.path.join(save_dir, f"round_{r+1}")
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            save_target = (model_engine.module if model_engine is not None else model)
+            save_target.save_pretrained(ckpt_dir)
+            # 写入元数据，记录最新 round
+            meta_path = os.path.join(save_dir, "ckpt_meta.json")
+            meta = {"latest_round": r+1, "ckpt_dir": ckpt_dir, "global_step": int(global_step)}
+            with open(meta_path, "w", encoding="utf-8") as mf:
+                json.dump(meta, mf, ensure_ascii=False, indent=2)
+            log.info(f"[Train] Saved round {r+1} ckpt to {ckpt_dir}")
+        except Exception:
+            except_log("save round ckpt failed")
+
         # 每轮结束：清理缓存与临时对象，恢复训练模式
         if model_engine is not None:
             model_engine.train()
@@ -628,11 +803,14 @@ def run_training_rounds(
             torch.cuda.synchronize()
         free_torch_memory()
 
-    # 5) 保存 LoRA 适配器
+    # 5) 保存最终 LoRA 适配器到顶层目录（便于统一加载）
     assert save_dir is not None and len(str(save_dir)) > 0
-    save_target = (model_engine.module if model_engine is not None else model)
-    save_target.save_pretrained(save_dir)
-    log.info(f"[Train] LoRA adapter saved to: {save_dir}")
+    try:
+        save_target = (model_engine.module if model_engine is not None else model)
+        save_target.save_pretrained(save_dir)
+        log.info(f"[Train] LoRA adapter saved to: {save_dir}")
+    except Exception:
+        except_log("save_pretrained final failed")
 
     # 训练资源释放：删除大型对象并清理显存，防止与验证/测试相互影响
     for name in ['samples', 'model_engine', 'model', 'base_model', 'processor']:
@@ -831,9 +1009,14 @@ if __name__ == "__main__":
         default="infer",
         help="运行模式：train 训练，infer 验证与测试（默认 infer）",
     )
+    parser.add_argument(
+        "--force_retrain",
+        action="store_true",
+        help="训练模式下强制重新训练，不加载已有 ckpt（默认 false）",
+    )
     args = parser.parse_args()
 
-    version_symb = "v3"
+    version_symb = "v4"
 
     mode = args.mode
     assert mode in {"train", "infer"}, "invalid mode"
@@ -849,18 +1032,19 @@ if __name__ == "__main__":
     test_tsv = os.path.join(base_dir, "IC_test.tsv")
     test_jsonl = os.path.join(base_dir, "IC_test.jsonl")
 
-    IMAGE_SIZE = 224
+    IMAGE_SIZE = 128 ## 图片缩小了。
     # ROUNDS = 1
 
     # 设置 LoRA 适配器保存地址（用于后续验证/测试加载）
-    lora_save_dir = os.path.join(base_dir, f"outputs_{version_symb}_lora")
+    model_base_dir = f"/mnt/d/forCoding_data/Tianchi_MUGE/trained_models/ECommerce-IC/"
+    lora_save_dir = os.path.join(model_base_dir, f"outputs_{version_symb}_lora")
     if mode == "train":
         # 1) 训练：按轮次加载且不重叠，使用 LoRA 做真实 SFT
         run_training_rounds(
             train_tsv=train_tsv,
             train_jsonl=train_jsonl,
-            rounds=1,
-            per_round_lines=100,
+            rounds=50,
+            per_round_lines=1000,
             image_size=IMAGE_SIZE,
             show_progress=True,
             save_dir=lora_save_dir,
@@ -869,10 +1053,11 @@ if __name__ == "__main__":
             lora_r=4,
             lora_alpha=8,
             lora_dropout=0.05,
-            train_bs=4,
+            train_bs=8,
             lr=5e-5,
             epochs=1,
-            gradient_accumulation_steps = 4
+            # gradient_accumulation_steps = 4
+            resume=(not args.force_retrain),
         )
         print("\n\n")
     else:
@@ -922,7 +1107,8 @@ if __name__ == "__main__":
         print("\n\n")
 
         # 3) 测试：分批生成占位文本，存为 example_pred.jsonl 风格
-        output_jsonl = os.path.join(base_dir, f"{version_symb}.jsonl")
+        output_base_dir = f"/mnt/d/forCoding_data/Tianchi_MUGE/preprocessdData/ECommerce-IC/"
+        output_jsonl = os.path.join(output_base_dir, f"{version_symb}.jsonl")
         # 清理验证阶段显存，切换到测试
         free_torch_memory()
 
@@ -946,14 +1132,3 @@ if __name__ == "__main__":
             processor=base_processor,
         )
         print("\n\n")
-
-
-## 部分提速尝试：
-# 已做改进
-
-# - 启用 cudnn.benchmark ，让卷积在固定尺寸下自动选择最快内核。
-# - 使用 pinned memory 与非阻塞搬运：对 CPU 张量调用 pin_memory() ，用 to(device, non_blocking=True) 提升 H2D吞吐。
-# - 将“用户段模板”批量一次性 tokenizer，避免逐样本重复 CPU 开销。
-# - 保持 AMP（ bf16 / fp16 ）与 TF32 开启以提高吞吐。
-# 这些改动减少了 CPU 侧准备与传输开销，能显著提升训练时 GPU 的占用与稳定性。
-
