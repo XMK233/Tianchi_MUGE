@@ -1,0 +1,211 @@
+graph LR
+    subgraph "输入层"
+        IMG("图像 x<br/>[bs, 1, h, w]")
+        TEXT("文本输入<br/>text: [bs]")
+        TIME("时间步<br/>t: [bs]")
+        CLASS("类别标签<br/>class_labels: [bs]")
+    end
+    
+    subgraph "文本编码层"
+        TOKEN("Tokenizer")
+        BERT("BERT模型<br/>仅最后几层可训练")
+        inputs("文本输入张量<br/>inputs: {input_ids, attention_mask}")
+        text_emb("文本嵌入<br/>text_emb: [bs, 768]")
+    end
+    
+    subgraph "U-Net编码器"
+        ENC1("下采样块1<br/>down1")
+        ENC2("下采样块2<br/>down2")
+        ENC3("下采样块3<br/>down3")
+        POOL1("池化层1<br/>pool1")
+        POOL2("池化层2<br/>pool2")
+        POOL3("池化层3<br/>pool3")
+        
+        d1("编码器输出1<br/>d1: [bs, 64, h, w]")
+        p1("池化输出1<br/>p1: [bs, 64, h/2, w/2]")
+        d2("编码器输出2<br/>d2: [bs, 128, h/2, w/2]")
+        p2("池化输出2<br/>p2: [bs, 128, h/4, w/4]")
+        d3("编码器输出3<br/>d3: [bs, 128, h/4, w/4]")
+        p3("池化输出3<br/>p3: [bs, 128, h/8, w/8]")
+    end
+    
+    subgraph "瓶颈层 (MoE + ViT)"
+        PROJ("ViT投影<br/>vproj_in")
+        vb("投影输出<br/>vb: [bs, vit_dim, h/8, w/8]")
+        S("序列转换<br/>flatten + transpose")
+        s("序列张量<br/>s: [bs, h/8*w/8, vit_dim]")
+        PE("位置编码<br/>pos_embed: [1, seq_len, vit_dim]")
+        s_pe("添加位置编码<br/>s + pos_embed")
+        
+        subgraph "专家混合 MoE"
+            EXPERTS("专家网络集合<br/>experts: [num_experts]")
+            GATE("门控网络<br/>gate")
+            
+            subgraph "专家1"
+                VBLOCKS1("ViT块序列<br/>blocks: [vit_layers]")
+                NORM1("层归一化<br/>norm")
+                PROJ_OUT1("输出投影<br/>proj_out")
+            end
+            
+            subgraph "专家2"
+                VBLOCKS2("ViT块序列<br/>blocks: [vit_layers]")
+                NORM2("层归一化<br/>norm")
+                PROJ_OUT2("输出投影<br/>proj_out")
+            end
+            
+            subgraph "专家N"
+                VBLOCKSN("ViT块序列<br/>blocks: [vit_layers]")
+                NORMN("层归一化<br/>norm")
+                PROJ_OUTN("输出投影<br/>proj_out")
+            end
+            
+            T_EMB("时间步嵌入<br/>t_emb: [bs, time_emb_size]")
+            C_EMB("类别嵌入<br/>class_emb: [bs, class_emb_size]")
+            P3_POOL("全局池化<br/>p3_pool: [bs, 128]")
+            gate_in("门控输入<br/>gate_in: [bs, 128+class_emb_size+time_emb_size]")
+            gate_logits("门控输出<br/>gate_logits: [bs, num_experts]")
+            gate_w("专家权重<br/>gate_w: [bs, num_experts]")
+            
+            se1("专家1序列输出<br/>se1: [bs, seq_len, vit_dim]")
+            se1_proj("专家1投影输出<br/>se1_proj: [bs, 128, h/8, w/8]")
+            yb_e1("加权专家1输出<br/>yb_e1: [bs, 128, h/8, w/8]")
+            
+            se2("专家2序列输出<br/>se2: [bs, seq_len, vit_dim]")
+            se2_proj("专家2投影输出<br/>se2_proj: [bs, 128, h/8, w/8]")
+            yb_e2("加权专家2输出<br/>yb_e2: [bs, 128, h/8, w/8]")
+            
+            seN("专家N序列输出<br/>seN: [bs, seq_len, vit_dim]")
+            seN_proj("专家N投影输出<br/>seN_proj: [bs, 128, h/8, w/8]")
+            yb_eN("加权专家N输出<br/>yb_eN: [bs, 128, h/8, w/8]")
+            
+            yb_sum("专家融合输出<br/>yb_sum: [bs, 128, h/8, w/8]")
+        end
+    end
+    
+    subgraph "U-Net解码器"
+        UPSAMP1("上采样<br/>scale_factor=2")
+        UPSAMP2("上采样<br/>scale_factor=2")
+        UPSAMP3("上采样<br/>scale_factor=2")
+        
+        UP1("上采样块1<br/>up1")
+        UP2("上采样块2<br/>up2")
+        UP3("上采样块3<br/>up3")
+        OUT("输出层<br/>out")
+        
+        u1_in("上采样输入1<br/>u1_in: [bs, 256, h/4, w/4]")
+        u1("上采样输出1<br/>u1: [bs, 128, h/4, w/4]")
+        u2_in("上采样输入2<br/>u2_in: [bs, 256, h/2, w/2]")
+        u2("上采样输出2<br/>u2: [bs, 128, h/2, w/2]")
+        u3_in("上采样输入3<br/>u3_in: [bs, 192, h, w]")
+        u3("上采样输出3<br/>u3: [bs, 64, h, w]")
+    end
+    
+    subgraph "输出层"
+        pred("噪声预测<br/>pred: [bs, 1, h, w]")
+        velocity("真实速度<br/>velocity: [bs, 1, h, w]")
+        loss("损失值<br/>loss: scalar")
+    end
+    
+    IMG --> ENC1
+    TEXT --> TOKEN
+    TOKEN --> inputs
+    inputs --> BERT
+    BERT --> text_emb
+    text_emb --> ENC1
+    CLASS --> C_EMB
+    TIME --> T_EMB
+    
+    ENC1 --> d1
+    d1 --> POOL1
+    POOL1 --> p1
+    p1 --> ENC2
+    ENC2 --> d2
+    d2 --> POOL2
+    POOL2 --> p2
+    p2 --> ENC3
+    ENC3 --> d3
+    d3 --> POOL3
+    POOL3 --> p3
+    
+    p3 --> PROJ
+    PROJ --> vb
+    vb --> S
+    S --> s
+    PE --> s
+    s --> EXPERTS
+    
+    T_EMB --> gate_in
+    C_EMB --> gate_in
+    p3 --> P3_POOL
+    P3_POOL --> gate_in
+    gate_in --> GATE
+    GATE --> gate_logits
+    gate_logits --> gate_w
+    
+    s --> VBLOCKS1
+    VBLOCKS1 --> se1
+    se1 --> NORM1
+    NORM1 --> se1_proj
+    se1_proj --> PROJ_OUT1
+    PROJ_OUT1 --> se1_proj
+    gate_w --> yb_e1
+    se1_proj --> yb_e1
+    
+    s --> VBLOCKS2
+    VBLOCKS2 --> se2
+    se2 --> NORM2
+    NORM2 --> se2_proj
+    se2_proj --> PROJ_OUT2
+    PROJ_OUT2 --> se2_proj
+    gate_w --> yb_e2
+    se2_proj --> yb_e2
+    
+    s --> VBLOCKSN
+    VBLOCKSN --> seN
+    seN --> NORMN
+    NORMN --> seN_proj
+    seN_proj --> PROJ_OUTN
+    PROJ_OUTN --> seN_proj
+    gate_w --> yb_eN
+    seN_proj --> yb_eN
+    
+    yb_e1 --> yb_sum
+    yb_e2 --> yb_sum
+    yb_eN --> yb_sum
+    
+    yb_sum --> UPSAMP1
+    UPSAMP1 --> u1_in
+    d3 --> u1_in
+    u1_in --> UP1
+    UP1 --> u1
+    u1 --> UPSAMP2
+    UPSAMP2 --> u2_in
+    d2 --> u2_in
+    u2_in --> UP2
+    UP2 --> u2
+    u2 --> UPSAMP3
+    UPSAMP3 --> u3_in
+    d1 --> u3_in
+    u3_in --> UP3
+    UP3 --> u3
+    u3 --> OUT
+    OUT --> pred
+    
+    pred --> loss
+    velocity --> loss
+    
+    classDef inputClass fill:#e3f2fd
+    classDef textClass fill:#f3e5f5
+    classDef encoderClass fill:#e8f5e8
+    classDef moeClass fill:#fff3e0
+    classDef decoderClass fill:#e8f5e8
+    classDef outputClass fill:#e1f5fe
+    classDef lossClass fill:#ffebee
+    
+    class IMG,TEXT,TIME,CLASS inputClass
+    class TOKEN,BERT,inputs,text_emb textClass
+    class ENC1,ENC2,ENC3,POOL1,POOL2,POOL3,d1,p1,d2,p2,d3,p3 encoderClass
+    class EXPERTS,GATE,VBLOCKS1,VBLOCKS2,VBLOCKSN,NORM1,NORM2,NORMN,PROJ_OUT1,PROJ_OUT2,PROJ_OUTN,T_EMB,C_EMB,P3_POOL,gate_in,gate_logits,gate_w,se1,se1_proj,yb_e1,se2,se2_proj,yb_e2,seN,seN_proj,yb_eN,yb_sum moeClass
+    class UPSAMP1,UPSAMP2,UPSAMP3,UP1,UP2,UP3,OUT,u1_in,u1,u2_in,u2,u3_in,u3 decoderClass
+    class pred,velocity outputClass
+    class loss lossClass

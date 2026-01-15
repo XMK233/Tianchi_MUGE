@@ -1,0 +1,55 @@
+flowchart TD
+    S[开始] --> L0[读取训练图像和文本 TSV]
+    L0 --> D0[构建 TSVCSVImageDataset]
+    D0 --> DL[构建 DataLoader batch size 1]
+
+    S --> TE0[加载 Qwen2.5 VL 模型]
+    TE0 --> LO[构建 LoRA 配置并封装 Qwen]
+    LO --> TE1[得到可训练文本编码器]
+    TE1 --> NS[构建 DDPMScheduler v_prediction]
+    NS --> UN[加载预训练 UNet2DModel 封装为 TextConditionedDDPMUNet]
+    UN --> OPT[构建 AdamW 优化器 和 GradScaler]
+    OPT --> EMA[复制网络作为 EMA 模型]
+
+    subgraph TrainLoop[训练循环 持续多个 epoch]
+        DL --> B0[取一批 x 和 文本]
+        B0 --> B1[图像变换后缩放到 -1 到 1]
+        B0 --> B2[文本批次 encode_text_batch 得到 text_emb]
+        B1 --> N0[采样高斯噪声 noise]
+        N0 --> T0[采样时间步 t 0 到 999]
+        B1 --> NX[用 scheduler add_noise 得到 noisy_x]
+        NX --> FWD[在 autocast 中前向 net noisy_x t dummy_y text_emb]
+        B2 --> FWD
+        FWD --> VEL[用 scheduler get_velocity 计算目标 velocity]
+        VEL --> W0[根据 SNR 计算权重]
+        W0 --> L[加权 MSE 损失]
+        L --> BP[GradScaler backward unscale 梯度裁剪]
+        BP --> STEP[优化器 step 更新参数]
+        STEP --> EMAUPD[更新 EMA 模型参数]
+        EMAUPD --> LC[记录 loss 用于平均]
+    end
+
+    LC --> CKPT[每个 epoch 保存 net ema text_encoder scaler 等到 checkpoint]
+
+    CKPT -->|每5个epoch| SAMPLER[构建 DDIMScheduler 拷贝配置]
+    SAMPLER --> SG0[生成若干采样文本]
+    SG0 --> SE0[encode_text_batch 得到 text_emb_sample]
+    SE0 --> SG1[从正态噪声初始化 xg]
+    SG1 --> SG2[循环 DDIM 时间步 调用 ema net 做预测并更新 xg]
+    SG2 --> IMG[保存训练中采样图片网格]
+
+    CKPT --> VAL0[读取验证图像和文本 TSV]
+    VAL0 --> VAL1[遍历若干验证样本]
+    VAL1 --> VE0[对文本 encode_text_batch]
+    VAL1 --> VE1[图像做同样变换存作 real 图片]
+    VE0 --> VE2[从噪声初始化 x]
+    VE2 --> VE3[DDIM 多步采样 调 net 得到生成图像]
+    VE3 --> HTML[生成对照 HTML 页面 保存生成和真实图片]
+    VE3 --> FE0[收集生成图片用于 FID]
+    VE1 --> FE1[收集真实图片用于 FID]
+
+    FE0 --> FID0[加载 Inception v3 特征网络]
+    FE1 --> FID0
+    FID0 --> FID1[提取特征向量]
+    FID1 --> FID2[计算简单版 FID 指标并输出]
+    FID2 --> E[结束]

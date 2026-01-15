@@ -1,0 +1,24 @@
+flowchart TD
+    A[初始化] --> B[数据加载]
+    B --> C[预处理文本]
+    C --> D("获取文本嵌入<br/>text_emb: [bs, 768]")
+    D --> E("添加噪声到图像<br/>noisy_x: [bs, 1, h, w]")
+    E --> F[模型前向传播]
+    F --> G("预测噪声<br/>pred: [bs, 1, h, w]")
+    G --> H("计算真实速度<br/>velocity: [bs, 1, h, w]")
+    H --> I("计算损失<br/>loss: scalar")
+    I --> J{损失是否收敛?}
+    J -->|否| K[反向传播]
+    K --> L[更新模型参数]
+    L --> M[更新EMA参数]
+    M --> N[记录损失]
+    N --> O[保存模型]
+    O --> P[生成样本]
+    P --> Q{训练完成?}
+    Q -->|否| B
+    Q -->|是| R[结束]
+    
+    style A fill:#e1f5fe
+    style J fill:#fff3e0
+    style Q fill:#fff3e0
+    style R fill:#e8f5e8

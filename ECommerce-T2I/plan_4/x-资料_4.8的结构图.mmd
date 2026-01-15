@@ -1,0 +1,28 @@
+flowchart LR
+    subgraph Data
+        I0[训练图像 TSV] --> I1[解码 base64 为 RGB 图片]
+        I1 --> I2[图像变换 Resize 256x256 Gray ToTensor]
+        I2 --> X[x 单通道张量]
+        T0[训练文本 TSV] --> T1[文本字符串]
+    end
+
+    subgraph TextEncoder[文本编码器 Qwen2.5 VL + LoRA]
+        T1 --> TK[Tokenizer]
+        TK --> TE[Qwen 基座模型]
+        TE --> LE[应用 LoRA]
+        LE --> E[text_emb]
+    end
+
+    subgraph DDPMNet[TextConditionedDDPMUNet]
+        X --> XN[缩放到 -1 到 1]
+        XN --> R[复制成3通道图像]
+        E --> L1[线性层 text_to_cond]
+        L1 --> BIAS[生成3通道偏置特征]
+        R --> ADD[图像与偏置相加]
+        BIAS --> ADD
+        ADD --> U[UNet2DModel google ddpm cifar10 32]
+        U --> O[UNet 输出 多通道]
+        O --> O1[按通道求均值 得到单通道预测]
+    end
+
+    E -.条件传入 .-> DDPMNet

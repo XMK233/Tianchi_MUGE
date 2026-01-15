@@ -300,8 +300,9 @@ def caption_batch(
                 gen_kwargs = {
                     'max_new_tokens': int(max_new_tokens),
                     'do_sample': False,
-                    'no_repeat_ngram_size': 3,
-                    'repetition_penalty': 1.1,
+                    # 'no_repeat_ngram_size': 3,
+                    # 'repetition_penalty': 1.1,
+                    # "num_beams": 2, 
                 }
                 # 仅在使用 beam search 时才启用 early_stopping，避免无效参数告警
                 if int(gen_kwargs.get('num_beams', 1)) > 1:
@@ -348,7 +349,7 @@ def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
     """将每张图片的多条文本描述展开为多个样本。
 
     输入样本形如：{"image_id": str, "image": PIL.Image, "text": Union[str, list[str], None]}
-    输出样本形如：{"image_id": str, "image": PIL.Image, "text": str}
+    输出样本形如：{"image_id": str, "image": PIL.Image, "text": str, "text_list": list[str]}
 
     - 当 text 为 list[str] 时：为同一张图的每条文本生成一个独立样本。
     - 当 text 为 str 时：保持为单一样本。
@@ -359,15 +360,18 @@ def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
         img_id = s.get("image_id")
         img = s.get("image")
         text = s.get("text")
+        # 保存原始文本列表（用于SCST训练的CIDEr计算）
+        text_list = []
         if isinstance(text, list):
-            # 仅随机选择至多 3 条有效文本，减少每图样本数
             valid_texts = [t.strip() for t in text if isinstance(t, str) and len(t.strip()) > 0]
+            text_list = valid_texts.copy()
             if valid_texts:
-                select_k = min(1, len(valid_texts))
+                select_k = min(2, len(valid_texts)) ## 在这里设置加载的条数。
                 for t in random.sample(valid_texts, k=select_k):
-                    expanded.append({"image_id": img_id, "image": img, "text": t})
+                    expanded.append({"image_id": img_id, "image": img, "text": t, "text_list": text_list})
         elif isinstance(text, str) and len(text.strip()) > 0:
-            expanded.append({"image_id": img_id, "image": img, "text": text.strip()})
+            text_list = [text.strip()]
+            expanded.append({"image_id": img_id, "image": img, "text": text.strip(), "text_list": text_list})
         else:
             # 无文本，训练阶段跳过
             continue
@@ -569,7 +573,8 @@ def run_training_rounds(
         if round_sample_count == 0:
             log.warning(f"[Train] Round {r+1}: no usable samples after expansion")
             continue
-
+            
+        ## sft阶段
         for epoch in range(epochs):
             log.info(f"[Train] Epoch {epoch+1}/{epochs} on {round_sample_count} samples")
             for i in tqdm.tqdm(range(0, round_sample_count, train_bs), desc=f"Epoch {epoch+1}/{epochs}"):
@@ -634,116 +639,205 @@ def run_training_rounds(
                     labels[inputs["attention_mask"] == 0] = -100
                 inputs["labels"] = labels
 
-                try:
-                    if model_engine is None:
-                        # branch_log()
-                        optimizer.zero_grad(set_to_none=True)
-                        if use_amp and device.type == "cuda":
-                            if amp_dtype.lower() == "bf16":
-                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                    out = model(**inputs)
-                            else:
-                                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                    out = model(**inputs)
-                        else:
-                            out = model(**inputs)
-                        loss = out.loss
-                        loss.backward()
-                        optimizer.step()
-                    else:
-                        # branch_log()
-                        # DeepSpeed 引擎前向/反向/步进
-                        # DeepSpeed 路径按照 DS 配置控制混合精度，不再套 torch.autocast，避免双重设置
-                        model_engine.zero_grad()
-                        out = model_engine(**inputs)
-                        loss = out.loss
-                        model_engine.backward(loss)
-                        model_engine.step()
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                    msg = str(e).lower()
-                    if "out of memory" in msg or "cuda error: out of memory" in msg:
-                        except_log("OOM during training step; applying fallback")
-                        # 释放当前图与缓存
-                        for name in ["out", "loss", "inputs", "labels", "user_batch"]:
-                            if name in locals():
-                                del locals()[name]
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            torch.cuda.ipc_collect()
-                        # 尝试将当前批次拆分为两半依次训练，以降低峰值显存
-                        if len(batch) >= 2:
-                            half = len(batch) // 2
-                            sub_batches = [batch[:half], batch[half:]]
-                            for sub in sub_batches:
-                                sub_images = [s["image"] for s in sub]
-                                sub_targets = [s.get("text") or "" for s in sub]
-                                sub_texts = []
-                                for tgt in sub_targets:
-                                    messages = [
-                                        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]},
-                                        {"role": "assistant", "content": [{"type": "text", "text": tgt}]},
-                                    ]
-                                    t = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-                                    sub_texts.append(t)
-                                sub_inputs = processor(
-                                    text=sub_texts,
-                                    images=sub_images,
-                                    return_tensors="pt",
-                                    padding=True,
-                                    truncation=True,
-                                    max_length=384,
-                                )
-                                for k, v in list(sub_inputs.items()):
-                                    if isinstance(v, torch.Tensor) and v.device.type == "cpu":
-                                        sub_inputs[k] = v.pin_memory()
-                                sub_inputs = {k: (v.to(device, non_blocking=True) if hasattr(v, "to") else v) for k, v in sub_inputs.items()}
-
-                                try:
-                                    if model_engine is None:
-                                        optimizer.zero_grad(set_to_none=True)
-                                        if use_amp and device.type == "cuda":
-                                            if amp_dtype.lower() == "bf16":
-                                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                                    sub_out = model(**sub_inputs)
-                                            else:
-                                                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                                                    sub_out = model(**sub_inputs)
-                                        else:
-                                            sub_out = model(**sub_inputs)
-                                        sub_loss = sub_out.loss
-                                        sub_loss.backward()
-                                        optimizer.step()
-                                    else:
-                                        model_engine.zero_grad()
-                                        sub_out = model_engine(**sub_inputs)
-                                        sub_loss = sub_out.loss
-                                        model_engine.backward(sub_loss)
-                                        model_engine.step()
-                                except Exception:
-                                    except_log("Fallback half-batch failed; skipping this sub-batch")
-                                finally:
-                                    for name in ["sub_out", "sub_loss", "sub_inputs"]:
-                                        if name in locals():
-                                            del locals()[name]
-                                    if torch.cuda.is_available():
-                                        torch.cuda.empty_cache()
-                            # 跳过原批次，继续下一批
-                            continue
-                        else:
-                            # 无法拆分，直接跳过该批次
-                            continue
-                    else:
-                        raise
+                model_engine.zero_grad()
+                out = model_engine(**inputs)
+                loss = out.loss
+                model_engine.backward(loss)
+                model_engine.step()
                 global_step += 1
-                # if global_step % 10 == 0:
+                
             log.info(f"[Train] step={global_step}, loss={loss.item():.4f}")
 
+        # SCST训练阶段
+        log.info(f"[SCST] Starting SCST training for Round {r+1}, Epoch {epoch+1}")
+        scst_epoch_loss = 0.0
+        scst_step = 0
+        
+        for i in tqdm.tqdm(range(0, round_sample_count, train_bs), desc=f"SCST Epoch {epoch+1}/{epochs}"):
+            batch = expanded_samples[i:i+train_bs]
+            if not batch:
+                continue
+                
+            images = [s["image"] for s in batch]
+            # 参考文本列表（用于CIDEr计算）
+            ref_texts_list = [s.get("text_list", []) for s in batch]
+            
+            # 1. 生成baseline文本（greedy解码）
+            # 构造正确的对话模板
+            texts_user = []
+            for _img in images:
+                msg_user = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+                txt_user = processor.apply_chat_template(msg_user, tokenize=False, add_generation_prompt=True)
+                texts_user.append(txt_user)
+            
+            baseline_inputs = processor(
+                text=texts_user,
+                images=images,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            baseline_inputs = {k: v.to(device) for k, v in baseline_inputs.items()}
+            
+            with torch.no_grad():
+                baseline_outputs = model_engine.generate(
+                    **baseline_inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    pad_token_id=processor.tokenizer.pad_token_id,
+                    eos_token_id=processor.tokenizer.eos_token_id
+                )
+            
+            # 解码baseline文本：只解码生成部分
+            baseline_texts = []
+            for bi in range(len(batch)):
+                gen_ids = baseline_outputs[bi][baseline_inputs["input_ids"][bi].shape[0]:].detach().cpu()
+                t = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+                baseline_texts.append(str(t).strip())
+            
+            # 2. 生成采样文本（带随机性的解码）
+            # 构造正确的对话模板
+            texts_user_sampled = []
+            for _img in images:
+                msg_user = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
+                txt_user = processor.apply_chat_template(msg_user, tokenize=False, add_generation_prompt=True)
+                texts_user_sampled.append(txt_user)
+            
+            sampled_inputs = processor(
+                text=texts_user_sampled,
+                images=images,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            )
+            sampled_inputs = {k: v.to(device) for k, v in sampled_inputs.items()}
+            
+            # 采样生成，需要计算梯度
+            sampled_outputs = model_engine.generate(
+                **sampled_inputs,
+                max_new_tokens=128,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=processor.tokenizer.pad_token_id,
+                eos_token_id=processor.tokenizer.eos_token_id,
+                output_scores=True,
+                return_dict_in_generate=True
+            )
+            
+            # 解码采样文本：只解码生成部分
+            sampled_texts = []
+            for bi in range(len(batch)):
+                gen_ids = sampled_outputs.sequences[bi][sampled_inputs["input_ids"][bi].shape[0]:].detach().cpu()
+                t = processor.batch_decode([gen_ids], skip_special_tokens=True)[0]
+                sampled_texts.append(str(t).strip())
+            
+            # 3. 计算CIDEr奖励
+            rewards = []
+            for ref_texts, baseline_text, sampled_text in zip(ref_texts_list, baseline_texts, sampled_texts):
+                # 计算采样文本的CIDEr分数
+                sampled_cider = compute_cider([sampled_text], [ref_texts])
+                # 计算baseline文本的CIDEr分数
+                baseline_cider = compute_cider([baseline_text], [ref_texts])
+                # 计算优势函数
+                advantage = sampled_cider - baseline_cider
+                rewards.append(advantage)
+            
+            rewards = torch.tensor(rewards, device=device, dtype=torch.float32)
+            
+            # 4. 计算SCST损失 - 简化版本：直接使用生成的序列计算log概率
+            # 获取所有序列的生成部分
+            generated_sequences = []
+            input_lens = []
+            
+            for seq_idx, seq in enumerate(sampled_outputs.sequences):
+                input_len = sampled_inputs["input_ids"][seq_idx].shape[0]  # 修复：恢复为输入部分的长度
+                generated_seq = seq[input_len:]
+                generated_sequences.append(generated_seq)
+                input_lens.append(input_len)
+            
+            # 计算损失
+            if all(len(seq) <= 1 for seq in generated_sequences):
+                # 如果所有生成序列都为空或只有一个token，跳过此批次
+                scst_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            else:
+                # 构造完整的输入序列（包括生成的部分）
+                full_sequences = sampled_outputs.sequences
+                
+                # 运行模型获取所有位置的logits
+                # 使用与采样时相同的输入参数
+                model_inputs = {
+                    'input_ids': full_sequences,
+                    'attention_mask': torch.ones_like(full_sequences, dtype=torch.long, device=device),
+                    'pixel_values': sampled_inputs["pixel_values"]
+                }
+                
+                # 添加其他可能需要的参数
+                for key in ['image_grid_thw', 'pixel_values_labels', 'image_embeds']:
+                    if key in sampled_inputs:
+                        model_inputs[key] = sampled_inputs[key]
+                
+                outputs = model_engine(
+                    **model_inputs
+                )
+                
+                # 获取logits [batch_size, seq_len, vocab_size]
+                logits = outputs.logits
+                
+                # 计算log_probs
+                log_probs = []
+                
+                for seq_idx, seq in enumerate(full_sequences):
+                    input_len = input_lens[seq_idx]
+                    generated_seq = seq[input_len:]
+                    
+                    if len(generated_seq) <= 1:
+                        # 如果生成序列为空或只有一个token，log概率为0
+                        log_probs.append(torch.tensor(0.0, device=device, requires_grad=True))
+                        continue
+                    
+                    # 计算生成部分的log概率
+                    seq_log_probs = []
+                    
+                    for pos_idx in range(input_len, seq.shape[0] - 1):
+                        # 当前位置的logits
+                        pos_logits = logits[seq_idx, pos_idx]
+                        # 下一个token
+                        next_token = seq[pos_idx + 1]
+                        # 计算log_softmax并获取下一个token的log概率
+                        pos_log_prob = torch.nn.functional.log_softmax(pos_logits, dim=-1)[next_token]
+                        seq_log_probs.append(pos_log_prob)
+                    
+                    # 求和得到序列的总log概率
+                    seq_total_log_prob = torch.sum(torch.stack(seq_log_probs))
+                    log_probs.append(seq_total_log_prob)
+                
+                log_probs = torch.stack(log_probs)
+                
+                # SCST损失：- (reward - baseline_reward) * log_prob
+                scst_loss = -torch.mean(rewards * log_probs)
+            
+            # 5. 反向传播和参数更新
+            model_engine.zero_grad()
+            model_engine.backward(scst_loss)
+            model_engine.step()
+            
+            scst_epoch_loss += scst_loss.item()
+            scst_step += 1
+            global_step += 1
+            
+            if scst_step % 10 == 0:
+                log.info(f"[SCST] step={global_step}, loss={scst_loss.item():.4f}")
+        
+        if scst_step > 0:
+            avg_scst_loss = scst_epoch_loss / scst_step
+            log.info(f"[SCST] Average SCST loss: {avg_scst_loss:.4f}")
+        
         # 该轮结束可做一次小样例推理检查
         warmup_n = min(2, len(samples))
         infer_model = (model_engine.module if model_engine is not None else model)
         # 切到 eval 模式，避免训练态下的随机性与回显
         infer_model.eval()
-        # Warmup 推理：显式限制生成长度、开启轻量后处理去重与去噪
+        # Warmup 推理：显式限制长度、开启轻量后处理去重与去噪
         preds = caption_batch(
             samples[:warmup_n],
             infer_model,
@@ -1016,7 +1110,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    version_symb = "v4"
+    version_symb = "v4.2"
 
     mode = args.mode
     assert mode in {"train", "infer"}, "invalid mode"
@@ -1025,14 +1119,19 @@ if __name__ == "__main__":
 
     # 这里给出一个模板式的调用示例。实际路径请根据你的数据位置替换。
     base_dir = "/mnt/d/forCoding_data/Tianchi_MUGE/originalData/ECommerce-IC/"
-    train_tsv = os.path.join(base_dir, "IC_train.tsv")
+
+    # train_tsv = os.path.join(base_dir, "IC_train.tsv")
+    train_tsv = os.path.join(base_dir, "IC_train_rnd_3w.tsv")
     train_jsonl = os.path.join(base_dir, "IC_train.jsonl")
-    valid_tsv = os.path.join(base_dir, "IC_valid.tsv")
+
+    # valid_tsv = os.path.join(base_dir, "IC_valid.tsv")
+    valid_tsv = os.path.join(base_dir, "IC_valid_rnd_2k.tsv")
     valid_jsonl = os.path.join(base_dir, "IC_valid.jsonl")
+
     test_tsv = os.path.join(base_dir, "IC_test.tsv")
     test_jsonl = os.path.join(base_dir, "IC_test.jsonl")
 
-    IMAGE_SIZE = 128 ## 图片缩小了。
+    IMAGE_SIZE = 32 ## 图片缩小了。
     # ROUNDS = 1
 
     # 设置 LoRA 适配器保存地址（用于后续验证/测试加载）
@@ -1043,7 +1142,7 @@ if __name__ == "__main__":
         run_training_rounds(
             train_tsv=train_tsv,
             train_jsonl=train_jsonl,
-            rounds=50,
+            rounds=10,
             per_round_lines=1000,
             image_size=IMAGE_SIZE,
             show_progress=True,
@@ -1095,7 +1194,7 @@ if __name__ == "__main__":
             local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
             lora_dir=lora_save_dir,
             # 推理加速参数（可按显存情况调整）
-            infer_bs=2,
+            infer_bs=4,
             use_amp=True,
             amp_dtype="bf16",
             max_new_tokens=48,
@@ -1112,23 +1211,23 @@ if __name__ == "__main__":
         # 清理验证阶段显存，切换到测试
         free_torch_memory()
 
-        run_test(
-            test_tsv=test_tsv,
-            test_jsonl=test_jsonl,
-            rounds=100,
-            per_round_lines=100,
-            output_jsonl=output_jsonl,
-            image_size=IMAGE_SIZE,
-            show_progress=True,
-            local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
-            lora_dir=lora_save_dir,
-            # 推理加速参数（与验证保持一致）
-            infer_bs=2,
-            use_amp=True,
-            amp_dtype="bf16",
-            max_new_tokens=48,
-            # 复用已加载模型与处理器，避免重复加载
-            model=infer_model,
-            processor=base_processor,
-        )
-        print("\n\n")
+        # run_test(
+        #     test_tsv=test_tsv,
+        #     test_jsonl=test_jsonl,
+        #     rounds=100,
+        #     per_round_lines=100,
+        #     output_jsonl=output_jsonl,
+        #     image_size=IMAGE_SIZE,
+        #     show_progress=True,
+        #     local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
+        #     lora_dir=lora_save_dir,
+        #     # 推理加速参数（与验证保持一致）
+        #     infer_bs=4,
+        #     use_amp=True,
+        #     amp_dtype="bf16",
+        #     max_new_tokens=48,
+        #     # 复用已加载模型与处理器，避免重复加载
+        #     model=infer_model,
+        #     processor=base_processor,
+        # )
+        # print("\n\n")

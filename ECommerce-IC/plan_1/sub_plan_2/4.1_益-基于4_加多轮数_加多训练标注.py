@@ -360,10 +360,10 @@ def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
         img = s.get("image")
         text = s.get("text")
         if isinstance(text, list):
-            # 仅随机选择至多 3 条有效文本，减少每图样本数
+            # 仅随机选择至多 ? 条有效文本，减少每图样本数
             valid_texts = [t.strip() for t in text if isinstance(t, str) and len(t.strip()) > 0]
             if valid_texts:
-                select_k = min(1, len(valid_texts))
+                select_k = min(2, len(valid_texts)) ## 在这里设置加载的条数。
                 for t in random.sample(valid_texts, k=select_k):
                     expanded.append({"image_id": img_id, "image": img, "text": t})
         elif isinstance(text, str) and len(text.strip()) > 0:
@@ -1016,7 +1016,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    version_symb = "v4"
+    version_symb = "v4.1"
 
     mode = args.mode
     assert mode in {"train", "infer"}, "invalid mode"
@@ -1043,8 +1043,8 @@ if __name__ == "__main__":
         run_training_rounds(
             train_tsv=train_tsv,
             train_jsonl=train_jsonl,
-            rounds=50,
-            per_round_lines=1000,
+            rounds=100,
+            per_round_lines=500,
             image_size=IMAGE_SIZE,
             show_progress=True,
             save_dir=lora_save_dir,
@@ -1055,7 +1055,7 @@ if __name__ == "__main__":
             lora_dropout=0.05,
             train_bs=8,
             lr=5e-5,
-            epochs=1,
+            epochs=2,
             # gradient_accumulation_steps = 4
             resume=(not args.force_retrain),
         )
@@ -1095,7 +1095,7 @@ if __name__ == "__main__":
             local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
             lora_dir=lora_save_dir,
             # 推理加速参数（可按显存情况调整）
-            infer_bs=2,
+            infer_bs=4,
             use_amp=True,
             amp_dtype="bf16",
             max_new_tokens=48,
@@ -1123,7 +1123,7 @@ if __name__ == "__main__":
             local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
             lora_dir=lora_save_dir,
             # 推理加速参数（与验证保持一致）
-            infer_bs=2,
+            infer_bs=4,
             use_amp=True,
             amp_dtype="bf16",
             max_new_tokens=48,

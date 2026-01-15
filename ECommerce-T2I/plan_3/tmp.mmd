@@ -1,0 +1,36 @@
+graph TD
+    classDef input fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef unet fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef time fill:#fff3e0,stroke:#ff6f00,stroke-width:2px;
+    classDef output fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+
+    subgraph Inputs ["输入端"]
+        Img["带噪图片 x_t"]:::input
+        T["时间步 t <br/> (例如: 850)"]:::time
+    end
+
+    subgraph Time_Processing ["时间处理"]
+        TE["Time Embedding<br/>(把数字变成向量)"]:::time
+    end
+
+    subgraph UNet_Model ["UNet 修复师"]
+        Layer1["第一层卷积"]:::unet
+        Layer2["中间层"]:::unet
+        Layer3["输出层"]:::unet
+        
+        Note["融合机制:<br/>将时间向量加到<br/>每一层的特征图上"]
+    end
+
+    Out["预测出的噪声 / 修复后的图"]:::output
+
+    %% 流程连接
+    Img --> Layer1
+    T --> TE
+    TE -->|"注入(Add/Mul)"| Layer1
+    Layer1 --> Layer2
+    TE -->|"注入(Add/Mul)"| Layer2
+    Layer2 --> Layer3
+    TE -->|"注入(Add/Mul)"| Layer3
+    Layer3 --> Out
+
+    %% 样式调整

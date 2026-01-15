@@ -300,8 +300,9 @@ def caption_batch(
                 gen_kwargs = {
                     'max_new_tokens': int(max_new_tokens),
                     'do_sample': False,
-                    'no_repeat_ngram_size': 3,
-                    'repetition_penalty': 1.1,
+                    # 'no_repeat_ngram_size': 3,
+                    # 'repetition_penalty': 1.1,
+                    # "num_beams": 2, 
                 }
                 # 仅在使用 beam search 时才启用 early_stopping，避免无效参数告警
                 if int(gen_kwargs.get('num_beams', 1)) > 1:
@@ -360,10 +361,10 @@ def _expand_multi_text_samples(samples: list[dict]) -> list[dict]:
         img = s.get("image")
         text = s.get("text")
         if isinstance(text, list):
-            # 仅随机选择至多 3 条有效文本，减少每图样本数
+            # 仅随机选择至多 ? 条有效文本，减少每图样本数
             valid_texts = [t.strip() for t in text if isinstance(t, str) and len(t.strip()) > 0]
             if valid_texts:
-                select_k = min(1, len(valid_texts))
+                select_k = min(2, len(valid_texts)) ## 在这里设置加载的条数。
                 for t in random.sample(valid_texts, k=select_k):
                     expanded.append({"image_id": img_id, "image": img, "text": t})
         elif isinstance(text, str) and len(text.strip()) > 0:
@@ -1016,7 +1017,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    version_symb = "v4"
+    version_symb = "v4.2"
 
     mode = args.mode
     assert mode in {"train", "infer"}, "invalid mode"
@@ -1025,10 +1026,15 @@ if __name__ == "__main__":
 
     # 这里给出一个模板式的调用示例。实际路径请根据你的数据位置替换。
     base_dir = "/mnt/d/forCoding_data/Tianchi_MUGE/originalData/ECommerce-IC/"
-    train_tsv = os.path.join(base_dir, "IC_train.tsv")
+
+    # train_tsv = os.path.join(base_dir, "IC_train.tsv")
+    train_tsv = os.path.join(base_dir, "IC_train_rnd_3w.tsv")
     train_jsonl = os.path.join(base_dir, "IC_train.jsonl")
-    valid_tsv = os.path.join(base_dir, "IC_valid.tsv")
+
+    # valid_tsv = os.path.join(base_dir, "IC_valid.tsv")
+    valid_tsv = os.path.join(base_dir, "IC_valid_rnd_2k.tsv")
     valid_jsonl = os.path.join(base_dir, "IC_valid.jsonl")
+
     test_tsv = os.path.join(base_dir, "IC_test.tsv")
     test_jsonl = os.path.join(base_dir, "IC_test.jsonl")
 
@@ -1043,7 +1049,7 @@ if __name__ == "__main__":
         run_training_rounds(
             train_tsv=train_tsv,
             train_jsonl=train_jsonl,
-            rounds=50,
+            rounds=1,
             per_round_lines=1000,
             image_size=IMAGE_SIZE,
             show_progress=True,
@@ -1055,7 +1061,7 @@ if __name__ == "__main__":
             lora_dropout=0.05,
             train_bs=8,
             lr=5e-5,
-            epochs=1,
+            epochs=5,
             # gradient_accumulation_steps = 4
             resume=(not args.force_retrain),
         )
@@ -1112,23 +1118,23 @@ if __name__ == "__main__":
         # 清理验证阶段显存，切换到测试
         free_torch_memory()
 
-        run_test(
-            test_tsv=test_tsv,
-            test_jsonl=test_jsonl,
-            rounds=1,
-            per_round_lines=100,
-            output_jsonl=output_jsonl,
-            image_size=IMAGE_SIZE,
-            show_progress=True,
-            local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
-            lora_dir=lora_save_dir,
-            # 推理加速参数（与验证保持一致）
-            infer_bs=4,
-            use_amp=True,
-            amp_dtype="bf16",
-            max_new_tokens=48,
-            # 复用已加载模型与处理器，避免重复加载
-            model=infer_model,
-            processor=base_processor,
-        )
-        print("\n\n")
+        # run_test(
+        #     test_tsv=test_tsv,
+        #     test_jsonl=test_jsonl,
+        #     rounds=100,
+        #     per_round_lines=100,
+        #     output_jsonl=output_jsonl,
+        #     image_size=IMAGE_SIZE,
+        #     show_progress=True,
+        #     local_model_dir="/mnt/d/HuggingFaceModels/models--Qwen--Qwen2.5-VL-3B-Instruct",
+        #     lora_dir=lora_save_dir,
+        #     # 推理加速参数（与验证保持一致）
+        #     infer_bs=4,
+        #     use_amp=True,
+        #     amp_dtype="bf16",
+        #     max_new_tokens=48,
+        #     # 复用已加载模型与处理器，避免重复加载
+        #     model=infer_model,
+        #     processor=base_processor,
+        # )
+        # print("\n\n")

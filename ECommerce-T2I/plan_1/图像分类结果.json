@@ -1,0 +1,271 @@
+{
+  "analysis_report": {
+    "视觉分类分布": {
+      "服装-下装": 15,
+      "服装-上衣": 15
+    },
+    "颜色分类分布": {
+      "多色调商品": 28,
+      "暖色调商品": 1,
+      "绿色/自然色商品": 1
+    },
+    "聚类详细信息": {
+      "聚类_0": {
+        "样本数量": 15,
+        "比例": "50.00%",
+        "类内方差": "176.5606",
+        "映射类别": "服装-上衣"
+      },
+      "聚类_1": {
+        "样本数量": 15,
+        "比例": "50.00%",
+        "类内方差": "304.8320",
+        "映射类别": "服装-下装"
+      }
+    },
+    "总样本数": 30,
+    "特征维度": 2048
+  },
+  "detailed_results": [
+    {
+      "index": 0,
+      "img_id": "09e4997f7caf1c67bab61ddb4daae55b",
+      "description": "简约田园藤编工艺餐厅吊灯创意个性服装店咖啡厅卧室圆球鸟巢",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 1,
+      "img_id": "d427045c6a80111d37683317ca962e8c",
+      "description": "日本洗面奶进口温和深清洁氨基酸泡沫洁面乳100g",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 2,
+      "img_id": "5636c6f1a2d4b614ef84d586506e8a18",
+      "description": "日系春秋女装红色毛衣背心两件套V领羊毛针织开衫女外套短款外搭",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 3,
+      "img_id": "807b7aba700dea23af04a1432f4ad845",
+      "description": "韩国复古雪纺高腰玫瑰印花百褶裙半身裙夏中长裙子女花朵2020爆款",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 4,
+      "img_id": "ac5b331f431aab80c25c29f017df75f0",
+      "description": "CCDD2019春装新品专柜正品时尚甜美连帽长袖套头卫衣女印花上衣潮",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 5,
+      "img_id": "e28d47d542dcc7d2077966a5ffc92ed0",
+      "description": "网纱连衣裙款气质不规则下摆透视中长裙女287510320",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 6,
+      "img_id": "4676a325f34cfbd8b40f03f568d7ff03",
+      "description": "慵懒风设计感圆领蕾丝边T恤女欧洲站2021夏季女装新款欧货潮韩版",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 7,
+      "img_id": "5c5a4c6c616329b9d541187958b05ed9",
+      "description": "韩版新生婴幼儿童胎帽可爱大耳朵棉质棉布套头帽男女宝宝帽子春秋",
+      "visual_category": "服装-下装",
+      "color_category": "暖色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 8,
+      "img_id": "d05eb51afbb488d25b8baf698b5628c4",
+      "description": "美国正品abercrombie fitch AF男新款圆领短袖T恤短T19",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 9,
+      "img_id": "626603c4278300bc6d6ee537b9518789",
+      "description": "品牌女装新品通勤绣花圆领套头卫衣女5982",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 10,
+      "img_id": "0fcb2c2416b085fbb83f67d8dc7de68c",
+      "description": "无袖背心女外穿针织夏韩版内搭挂脖圆环拉链修身短款露肩打底上衣",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 11,
+      "img_id": "a92ce2742815a5d99b782e462930ece6",
+      "description": "坠感高腰阔腿裤加长直筒裤垂感女裤超长休闲裤洋气工作裤显瘦系带",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 12,
+      "img_id": "221bd35dc6e17f63d26376fd1b3f8148",
+      "description": "【清仓】英伦风小皮鞋女雕花布洛克系带百搭低跟皮鞋真皮复古单鞋",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 13,
+      "img_id": "eb3f2538c547fa90aed22712252f333d",
+      "description": "【临期至21年3月31日】日本进口乳酸菌橡皮QQ软糖55g*3",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 14,
+      "img_id": "37b82b1ab5a4292705ea6e25fde20228",
+      "description": "丧暗黑风吊带裙女2021夏季新款高腰显瘦黑裙子设计感连衣裙",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 15,
+      "img_id": "aafe29e3475fb02c2dd1826ead4646b0",
+      "description": " AirMax98香芋粉紫气垫复古运动女跑步鞋AH6799-111",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 16,
+      "img_id": "157d9a002802481f534628e827d3c9b3",
+      "description": "韩国鱼胶原蛋白生物纤维面膜收缩毛孔补水嫩白淡斑女提拉紧致修复",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 17,
+      "img_id": "830f2aab8ecc27138a952d761b6d1e6b",
+      "description": "11/10S1098红米K40K30ProNOTE10NOTE9pro橘子花朵手机壳",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 18,
+      "img_id": "2b04efa750ee89be7d70506d50c14b83",
+      "description": "法单S家polo领短袖轻熟上衣女气质珍珠扣冰丝针织衫夏SFPPU00487",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 19,
+      "img_id": "e93ee55d5076954b323bcfd613d7a48e",
+      "description": "牛仔马甲连衣裙两件套2021春季新款女气质时尚显瘦洋气减龄套装",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 20,
+      "img_id": "28ffb9e4d335318856173f5eb674965c",
+      "description": "韩国专柜代购纽亦华NEW ERA夏季新款前拉链贴标双层小款斜跨包",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 21,
+      "img_id": "772eaa5586d71db3bfd522014405013f",
+      "description": "诸葛大力成果同款手表ins风森系学院风中学生少女独角兽星空夜光",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 22,
+      "img_id": "d78846e0d5ab92d1a0272278bb2e2d8d",
+      "description": "2018冬简约百搭女士系带休闲靴短筒粗跟靴H83W8419正码",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 23,
+      "img_id": "8f0f6687b8366dbe3daef461a6bbb477",
+      "description": "韩版夏季新款刺绣芝麻街卡通条纹大码宽松显瘦中长款短袖T恤女",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 24,
+      "img_id": "34595b6a0020d298f1a98f277877d308",
+      "description": "背心日单儿童宝宝女童孩纯棉衫打底睡衣家居一组3件夏款T恤",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 25,
+      "img_id": "6c49c74f81134a7f42d587512a05fbc8",
+      "description": "韩版网红气质发箍头箍纯棉针织复古纯色洗脸简约压发防滑百搭",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 26,
+      "img_id": "c5172ec821d34152694d3c6783f7eb5b",
+      "description": "男女童纯棉短裤2021夏季新款宝宝帅气五分裤洋气裤子运动裤",
+      "visual_category": "服装-上衣",
+      "color_category": "绿色/自然色商品",
+      "cluster_id": 0
+    },
+    {
+      "index": 27,
+      "img_id": "9a587031c647279eff8ddeaec36c6d34",
+      "description": "现代简约创意摆件手工个性时尚小花器家居装饰品水培花插花瓶田园",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 28,
+      "img_id": "68da536dde38a2d9e974d599729ac881",
+      "description": "民族风软底真皮凉拖鞋手工花朵皮鞋厚底松糕鞋森女系夏新款防水台",
+      "visual_category": "服装-下装",
+      "color_category": "多色调商品",
+      "cluster_id": 1
+    },
+    {
+      "index": 29,
+      "img_id": "b5fe7eb4e90dc524ae46440d31b084b8",
+      "description": "QLXJONLY秋季新款时尚宽松简约少女圆领t恤女118301511",
+      "visual_category": "服装-上衣",
+      "color_category": "多色调商品",
+      "cluster_id": 0
+    }
+  ]
+}
