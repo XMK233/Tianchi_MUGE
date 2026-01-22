@@ -1,0 +1,1 @@
+尝试一下新的范式，比如说ar+diffusion, transfusion之类。
