@@ -1,0 +1,73 @@
+graph TD
+    %% Define Styles
+    classDef data fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef model fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef process fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+
+    subgraph DataLoading
+        direction TB
+        A1["图片 TSV"] --> A3["TSVCSVImageDataset"]
+        A2["文本 TSV"] --> A3
+        A3 --> A4["Transforms\n(Resize, Grayscale, ToTensor)"]
+        A4 --> A5["DataLoader"]
+    end
+    class A1,A2,A3,A4,A5 data;
+
+    subgraph Architecture
+        direction TB
+        B1["输入图片 (B, 1, H, W)"]
+        B2["输入文本"]
+        
+        subgraph Text_Encoder
+            B3["Tokenizer"]
+            B4["Qwen2.5-VL Base"]
+            B5["LoRA Adapter"]
+            B3 --> B4 --> B5
+        end
+        
+        subgraph Fusion
+            C1["Image Features (Query)\nFlattened Spatial"]
+            C2["Text Embeddings (Key/Value)\nFull Sequence"]
+            C3["Multihead Attention"]
+            C4["Condition Map\n(B, Text_Ch, H, W)"]
+            
+            C1 --> C3
+            C2 --> C3
+            C3 --> C4
+        end
+        
+        subgraph Main_UNet
+            D1["Concat Input\n(B, 1+Text_Ch, H, W)"]
+            D2["UNet2DModel\n(Pretrained DDPM)"]
+            D3["Output (Velocity)"]
+            
+            D1 --> D2 --> D3
+        end
+        
+        B2 --> B3
+        B5 --> C2
+        B1 --> C1
+        B1 --> D1
+        C4 --> D1
+    end
+    class B1,B2,B3,B4,B5,C1,C2,C3,C4,D1,D2,D3 model;
+
+    subgraph TrainingLoop
+        direction TB
+        E1["Sample Batch"] --> E2["Encode Text (with Grad)"]
+        E2 --> E3["Add Noise (DDPMScheduler)"]
+        E3 --> E4["Model Forward"]
+        E4 --> E5["Calculate Loss\n(SNR Weighted MSE)"]
+        E5 --> E6["Backprop & Optimizer\n(Scaler, Clip Grad)"]
+        E6 --> E7["EMA Update"]
+        E7 --> E8{"End of Epoch?"}
+        E8 -- Yes --> E9["Save Checkpoint"]
+        E9 --> E10{"Epoch % 5 == 0?"}
+        E10 -- Yes --> E11["Validation Sampling\n(DDIM)"]
+        E10 -- No --> E1
+        E8 -- No --> E1
+    end
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E10,E11 process;
+
+    A5 --> E1
+    E4 -.-> Architecture

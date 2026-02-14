@@ -1,0 +1,73 @@
+flowchart TB
+
+%% 1) 模型结构
+subgraph M["模型结构（TextConditionedDDPMUNet + Qwen文本编码器(LoRA) + EMA）"]
+direction TB
+
+subgraph D["数据输入（TSVCSVImageDataset）"]
+direction TB
+D1["图片TSV：img_id -> base64<br/>TSV_PATH"] --> D2["base64解码 -> PIL"]
+D2 --> D3["tf：Resize256 -> Gray(1ch) -> ToTensor"]
+D4["文本TSV：img_id -> text<br/>TEXT_TSV_PATH"] --> D5["text字符串"]
+end
+
+subgraph T["文本侧（Qwen + LoRA）"]
+direction TB
+T1["load_vlm：AutoTokenizer + AutoModel<br/>Qwen2.5-VL-3B-Instruct"] --> T2["LoRA：get_peft_model<br/>target=q_proj,k_proj"]
+T2 --> T3["encode_text_batch：取last token hidden<br/>L2 normalize -> text_emb(B,hidden)"]
+end
+
+subgraph U["图像侧（UNet + 文本额外通道）"]
+direction TB
+U1["UNet2DModel（ddpm-cifar10-32）"] --> U2["conv_in扩展：in_ch = base_in_ch + text_channels(16)"]
+U3["Linear：hidden -> 16"] --> U4["cond_map：广播到(B,16,H,W)"]
+U5["x：1ch"] --> U6["repeat到base_in_ch（通常3ch）"]
+U6 --> U7["concat：z=[x_img,cond_map]"]
+U4 --> U7
+U7 --> U8["unet(z,t).sample"]
+U8 --> U9["若输出!=1ch：通道mean -> pred(1ch)"]
+end
+
+E1["net"] --- E2["net_ema（EMA副本）<br/>ema_decay=0.999"]
+end
+
+
+%% 2) 训练流程
+subgraph TR["训练流程（epoch/step）"]
+direction TB
+
+TR0["初始化：scheduler=DDPMScheduler(v_prediction)<br/>net/net_ema + AdamW + 可选GradScaler"] --> TR1["DataLoader：取(x,text)"]
+TR1 --> TR2["x归一化：x=x*2-1（到[-1,1]）"]
+TR2 --> TR3["text_emb=encode_text_batch(text)（grad=True）"]
+TR3 --> TR4["采样：noise~N(0,1)；t~U{0..999}"]
+TR4 --> TR5["noisy_x=add_noise(x,noise,t)"]
+TR5 --> TR6["pred=net(noisy_x,t,dummy_y,text_emb)"]
+TR4 --> TR7["target=velocity=get_velocity(x,noise,t)"]
+TR6 --> TR8["SNR权重：alpha_cumprod[t] -> snr -> weight"]
+TR7 --> TR9["loss=mean(weight*(pred-target)^2)"]
+TR8 --> TR9
+TR9 --> TR10["反传：AMP可选 + clip_grad + opt.step"]
+TR10 --> TR11["EMA更新：p_ema=ema*p_ema+(1-ema)*p"]
+TR11 --> TR12["每epoch保存ckpt：model/ema/text_encoder/scaler/epoch/step/loss"]
+TR12 --> TR13{"每5个epoch采样？"}
+TR13 -- "是" --> TR14["DDIM采样60步：用net_ema生成<br/>保存samples_bw_epoch*.png"]
+TR13 -- "否" --> TR1
+end
+
+
+%% 3) 推理/验证 + HTML + FID
+subgraph INF["推理/验证（VAL_TSV_PATH + VAL_TEXT_TSV_PATH）"]
+direction TB
+
+INF0["读VAL_TEXT_TSV：text_map(img_id->text)"] --> INF1["读VAL_IMG_TSV逐行(img_id,base64)（最多400）"]
+INF1 --> INF2["text_emb_val=encode_text_batch([text])（no_grad）"]
+INF1 --> INF3["真实图：base64->PIL->tf->proc_t(1ch)"]
+INF2 --> INF4["从噪声开始：DDIM采样30步<br/>residual=net(x,t,y,text_emb_val)"]
+INF4 --> INF5["gen后处理：clip(-1,1)->[0,1]->PIL"]
+INF5 --> INF6["分页HTML：img_id/text/生成图/真实预处理图"]
+INF3 --> INF7["FID real：proc_t（若1ch会repeat到3ch）"]
+INF5 --> INF8["FID gen：gen(1ch)"]
+INF6 --> INF9["FIDCalculator：timm inception_v3提特征<br/>计算FID近似值"]
+INF7 --> INF9
+INF8 --> INF9
+end
